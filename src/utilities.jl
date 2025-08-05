@@ -286,13 +286,31 @@ Fermi-Dirac distribution. The temperature T is in Kelvin.
 E is energy - chemical potential and is in eV.
 """
 function fermidirac(T::Float64, E::Float64)
-    kBT = 8.617333262145e-5 * T
+    beta = 1/(8.617333262145e-5 * T)  #1/kBT
     if T == 0.0
-        return (sign(-E) + 1.0) / 2
+        return (sign(-E) + 1.0) / 2 # theta(-E) function -E>0,1
     else
-        return 1 / (exp(E / kBT) + 1)
+        return 1.0 / (exp(E * beta) + 1.0)
     end
 end
+
+#fermidirac(T, ϵn-μ) to get Fermi-Dirac distribution
+
+"""
+    dfermi_dE(T, E)
+
+∂f/∂E of Fermi–Dirac distribution.
+* `T` : temperature in K
+* `E` : energy (already E - μ) in eV
+Returns value in 1/eV.
+"""
+function dfermi_dE(T::Float64, E::Float64)
+    T == 0.0 && return 0.0
+    f  = fermidirac(T, E)
+    β  = 1/(8.617333262145e-5 * T)
+    return -β * f * (1 - f)  #no NaN
+end
+
 
 function safe_fetch(f::Future)
     r = fetch(f)

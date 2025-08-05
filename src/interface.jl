@@ -268,6 +268,7 @@ function _parseopenmx(filepath::String)
     chem_p, E_temp = bound_multiread(Float64, 2)
     dipole_moment_core, dipole_moment_background = bound_multiread.(Float64, [3,3])
     Valence_Electrons, Total_SpinS = bound_multiread(Float64, 2)
+    println("Valence_Electrons = $Valence_Electrons, Total_SpinS = $Total_SpinS")
     dummy_blocks = bound_multiread(1)[1]
     for i in 1:dummy_blocks
         bound_multiread(UInt8, 256)
@@ -499,6 +500,8 @@ function _createmodelopenmx_inner(filepath::String, parserfunc::Function)
     return nm
 end
 function createmodelopenmx(filepath::String)
+    println("Using OpenMX parser for $filepath")
+    println("This may take a while, please be patient.")
     return _createmodelopenmx_inner(filepath, _parseopenmx)
 end
 function createmodelopenmx38(filepath::String)

@@ -60,6 +60,7 @@ function get_permittivity_k!(
 )
     nωs = size(ωs, 1)
     rα = getA(tm, α, k)
+    println("diagonal terms of rα: ", diag(rα))
     rβ = getA(tm, β, k)
     Es = geteig(tm, k).values
     for n in 1:tm.norbits, m in 1:tm.norbits
@@ -120,6 +121,7 @@ function getpermittivity(
     χs = [SharedArray{ComplexF64}(nωs) for _ in 1:nprocs()]
     parallel_do(k -> get_permittivity_k!(χs[myid()], tm, α, β, ωs, μ, k; ϵ=ϵ), mesh, batchsize=batchsize)
     bzvol = abs(det(tm.rlat))
+    println("bzvol: ", bzvol)
     return sum(χs) * bzvol / nks
 end
 

@@ -2,7 +2,7 @@ module Hall
 
 using LinearAlgebra, Distributed
 using ..HopTB
-using ..HopTB.Utilities: fermidirac, constructmeshkpts, splitkpts
+using ..HopTB.Utilities: fermidirac, dfermi_dE, constructmeshkpts, splitkpts
 using ..HopTB.Parallel: ParallelFunction, claim!, stop!, parallel_sum
 
 export getahc
@@ -168,6 +168,170 @@ function shc_worker(kpts::Matrix{Float64}, tm::TBModel, α::Int64, β::Int64, γ
     return result
 end
 
+function ahc_worker(kpts::Matrix{Float64}, tm::AbstractTBModel, 
+    ωs::Vector{Float64}, T::Float64, μ::Float64, δ::Float64)
+    result = zeros(Float64, length(ωs))
+    nkpts = size(kpts, 2)
+    for ik in 1:nkpts
+        k = kpts[:, ik]
+        vα = getvelocity(tm, 1, k); vβ = getvelocity(tm, 2, k)
+        egvals, _ = geteig(tm, k)
+        for (iω, ω)  in enumerate(ωs)
+            for n in 1:tm.norbits
+                ϵn = egvals[n]
+                fn = fermidirac(T, ϵn-μ)
+                for m in [1:n-1; n+1:tm.norbits]  # Combine ranges, skipping n
+                    ϵm = egvals[m]
+                    fm = fermidirac(T, ϵm-μ)
+                    fnm = (fn-fm)
+                    result[iω] += fnm * imag((vα[n, m]*vβ[m, n]) / ((ϵm - ϵn)^2 - (ω + im*δ)^2)) 
+                end    
+            end
+        end
+    end
+    return result
+end
+
+
+function ahcdc_worker(kpts::Matrix{Float64}, tm::AbstractTBModel, 
+    T::Float64, μ::Float64)
+    result = 0.0
+    nkpts = size(kpts, 2)
+    for ik in 1:nkpts
+        k = kpts[:, ik]
+        vα = getvelocity(tm, 1, k); vβ = getvelocity(tm, 2, k)
+        egvals, _ = geteig(tm, k)
+        for n in 1:tm.norbits
+            ϵn = egvals[n]
+            fn = fermidirac(T, ϵn-μ)
+            for m in [1:n-1; n+1:tm.norbits]  # Combine ranges, skipping n
+                ϵm = egvals[m]
+                result += fn * 2*imag((vα[n, m]*vβ[m, n]) / ((ϵm - ϵn)^2))
+            end   
+        end
+    end
+    return result
+end
+
+
+
+function AC_worker(kpts::Matrix{Float64}, tm::AbstractTBModel, α::Int64, β::Int64,
+    ωs::Vector{Float64}, T::Float64, μ::Float64, δ::Float64)
+    result = zeros(ComplexF64, length(ωs))
+    nkpts = size(kpts, 2)
+    for ik in 1:nkpts
+        k = kpts[:, ik]
+        vα = getvelocity(tm, α, k); vβ = getvelocity(tm, β, k)
+        egvals, _ = geteig(tm, k)
+        for (iω, ω)  in enumerate(ωs)
+            for n in 1:tm.norbits
+                ϵn = egvals[n]
+                fn = fermidirac(T, ϵn-μ)
+                for m in 1:tm.norbits
+                    ϵm = egvals[m]
+                    fm = fermidirac(T, ϵm-μ)
+                    if abs(ϵn-ϵm) > 1e-7
+                        fnm = (fn-fm)/(ϵn-ϵm)
+                        result[iω] += fnm * (vα[n, m]*vβ[m, n]) / (ϵn - ϵm + ω + im*δ) 
+                    else
+                         result[iω] += dfermi_dE(T, ϵn-μ) * (vα[n, m]*vβ[m, n] ) / ( ω + im*δ)
+                    end
+                end    
+            end
+        end
+    end
+    return result
+end
+
+@doc raw"""
+```julia
+getAC(tm::TBModel, α::Int64, β::Int64, ωs::Vector{Float64}, nkmesh::Vector{Int64};
+    T::Float64, μ::Float64;gs::Int64=1, δ::Float64=0.05)::Vector{ComplexF64}
+'''note
+The 2D unit is e**2/hbar, while the 3D unit is (Ω ⋅ cm)^-1.
+kubo-greenwood Formula from PHYSICAL REVIEW B 98, 115115 (2018)
+
+'''    
+
+"""
+
+function getAC(tm::AbstractTBModel, α::Int64, β::Int64, ωs::Vector{Float64}, nkmesh::Vector{Int64},
+    T::Float64, μ::Float64; gs::Int64=1, δ::Float64=0.05)
+    size(nkmesh, 1) == 3 || error("nkmesh should be a 3-element vector.")
+    nkpts = prod(nkmesh)
+    kptslist = splitkpts(constructmeshkpts(nkmesh), nworkers())
+    pf = ParallelFunction(AC_worker, tm, α, β, ωs, T, μ, δ)
+    println("nworkers: ", nworkers())
+    for iw in 1:nworkers()
+        pf(kptslist[iw])
+    end
+
+    σ_ac = zeros(ComplexF64, length(ωs))
+    for iw in 1:nworkers()
+        σ_ac += claim!(pf)
+    end
+    stop!(pf)
+    bzvol = abs((tm.rlat[:, 1] × tm.rlat[:, 2])⋅tm.rlat[:, 3])
+    if nkmesh[3] == 1 # 2D case
+        println("get 2D AC conductivity.")
+        return -im * gs * σ_ac * bzvol / nkpts / (2 * pi) # e**2/hbar
+    else
+        return -im * gs * σ_ac*bzvol/nkpts * (98.130728142) # e**2/(hbar*(2π)^3)*1.0e10/100
+    end
+end
+
+
+function getAhCω(tm::AbstractTBModel, ωs::Vector{Float64}, nkmesh::Vector{Int64},
+    T::Float64, μ::Float64; gs::Int64=1, δ::Float64=0.05)
+    size(nkmesh, 1) == 3 || error("nkmesh should be a 3-element vector.")
+    nkpts = prod(nkmesh)
+    kptslist = splitkpts(constructmeshkpts(nkmesh), nworkers())
+    pf = ParallelFunction(ahc_worker, tm, ωs, T, μ, δ)
+    println("nworkers: ", nworkers())
+    for iw in 1:nworkers()
+        pf(kptslist[iw])
+    end
+
+    σ_ahc = zeros(Float64, length(ωs))
+    for iw in 1:nworkers()
+        σ_ahc += claim!(pf)
+    end
+    stop!(pf)
+    bzvol = abs((tm.rlat[:, 1] × tm.rlat[:, 2])⋅tm.rlat[:, 3])
+    if nkmesh[3] == 1 # 2D case
+        println("get 2D AhC conductivity.")
+        return gs * σ_ahc * bzvol / nkpts / (2 * pi) # e**2/hbar
+    else
+        return gs * σ_ahc*bzvol/nkpts * (98.130728142) # e**2/(hbar*(2π)^3)*1.0e10/100
+    end
+end
+
+function getAhCDC(tm::AbstractTBModel, nkmesh::Vector{Int64},
+    T::Float64, μ::Float64; gs::Int64=1)
+    size(nkmesh, 1) == 3 || error("nkmesh should be a 3-element vector.")
+    nkpts = prod(nkmesh)
+    kptslist = splitkpts(constructmeshkpts(nkmesh), nworkers())
+    pf = ParallelFunction(ahcdc_worker, tm, T, μ)
+    println("nworkers: ", nworkers())
+    for iw in 1:nworkers()
+        pf(kptslist[iw])
+    end
+
+    σ_ahc = 0.0
+    for iw in 1:nworkers()
+        σ_ahc += claim!(pf)
+    end
+    stop!(pf)
+    bzvol = abs((tm.rlat[:, 1] × tm.rlat[:, 2])⋅tm.rlat[:, 3])
+    if nkmesh[3] == 1 # 2D case
+        println("get 2D AhC conductivity.")
+        return gs * σ_ahc * bzvol / nkpts / (2 * pi) # e**2/hbar
+    else
+        return gs * σ_ahc*bzvol/nkpts * (98.130728142) # e**2/(hbar*(2π)^3)*1.0e10/100
+    end
+end
+
+
 @doc raw"""
 ```julia
 getshc(tm::TBModel, α::Int64, β::Int64, γ::Int64, nkmesh::Vector{Int64};
@@ -196,7 +360,11 @@ function getshc(tm::TBModel, α::Int64, β::Int64, γ::Int64, nkmesh::Vector{Int
     Ts::Vector{Float64}=[0.0], μs::Vector{Float64}=[0.0], ϵ::Float64=0.1)
     size(nkmesh, 1) == 3 || error("nkmesh should be a 3-element vector.")
     nkpts = prod(nkmesh)
+    println("Calculating spin Hall conductivity for $nkpts k-points with mesh $(nkmesh) and $length(Ts) temperatures and $length(μs) chemical potentials.")
     kptslist = splitkpts(constructmeshkpts(nkmesh), nworkers())
+    @show size(kptslist)
+    @show size(kptslist,1)
+    @show size(kptslist[1])
     pf = ParallelFunction(shc_worker, tm, α, β, γ, Ts, μs, ϵ)
 
     for iw in 1:nworkers()
