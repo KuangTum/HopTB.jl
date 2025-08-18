@@ -2,6 +2,7 @@ module Interface
 
 using StaticArrays, LinearAlgebra
 using ..HopTB
+using HDF5
 
 export createmodelaims, createmodelopenmx, createmodelwannier
 
