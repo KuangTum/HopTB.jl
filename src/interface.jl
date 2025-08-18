@@ -4,7 +4,7 @@ using StaticArrays, LinearAlgebra
 using ..HopTB
 using HDF5
 
-export createmodelaims, createmodelopenmx, createmodelwannier
+export createmodelaims, createmodelopenmx, createmodelwannier, createmodeldeephopenmx
 
 # FHI-aims
 """
@@ -507,6 +507,152 @@ function createmodelopenmx(filepath::String)
 end
 function createmodelopenmx38(filepath::String)
     return _createmodelopenmx_inner(filepath, _parseopenmx38)
+end
+
+
+"""
+    createmodeldeephopenmx(dir::String)
+
+Construct a tight-binding model from a DeepH OpenMX-style directory.
+
+The directory `dir` is expected to contain:
+
+  * `lat.dat` – three lines with lattice vectors in Bohr units.
+  * `orbital_types.dat` – one line per atom listing orbital types.
+  * `site_positions.dat` – three lines giving atomic positions (Bohr).
+  * `hamiltonians_pred.h5` – datasets named `i/j/k/atom_i/atom_j` with
+    Hamiltonian blocks in Hartree.
+  * `openmx_olpr.scfout` – overlap and position matrices as produced by
+    OpenMX's `OLP` output.
+
+All lengths are converted from Bohr to Å and energies from Hartree to eV.
+"""
+function createmodeldeephopenmx(dir::String)
+    bohr_to_ang = 0.529177249
+    hartree_to_ev = 27.211399
+    HDF5 = Base.require(:HDF5)
+
+    # lattice vectors
+    lat = zeros(Float64, 3, 3)
+    open(joinpath(dir, "lat.dat")) do io
+        for i in 1:3
+            lat[:, i] = parse.(Float64, split(readline(io)))
+        end
+    end
+    lat .*= bohr_to_ang
+
+    # orbital numbers per atom
+    orb_lines = readlines(joinpath(dir, "orbital_types.dat"))
+    Total_NumOrbs = [length(split(strip(l))) for l in orb_lines]
+    numorb_base = cumsum([0; Total_NumOrbs[1:end-1]])
+    norbits = sum(Total_NumOrbs)
+
+    # atomic positions (currently unused, but parsed for completeness)
+    pos_lines = readlines(joinpath(dir, "site_positions.dat"))
+    natoms = length(split(pos_lines[1]))
+    Gxyz = zeros(Float64, 3, natoms)
+    for α in 1:3
+        Gxyz[α, :] = parse.(Float64, split(pos_lines[α])) * bohr_to_ang
+    end
+
+    # helper functions to parse overlap scfout
+    function _read_packed_f64(io, num)
+        buf = Vector{Float64}(undef, 4*num); read!(io, buf)
+        M = reshape(buf, 4, num)
+        Matrix(M[2:4, :])
+    end
+    function _read_packed_i32(io, num)
+        buf = Vector{Int32}(undef, 4*num); read!(io, buf)
+        M = reshape(buf, 4, num)
+        Int.(M[2:4, :])
+    end
+    function _read_block_f64(io, rows::Int, cols::Int)
+        M = Matrix{Float64}(undef, rows, cols); read!(io, M); M
+    end
+    function _read_olpr(filepath::String)
+        open(filepath, "r") do io
+            hdr = Vector{Int32}(undef, 7); read!(io, hdr)
+            atomnum      = Int(hdr[1])
+            spinP_switch = Int(hdr[2]) & 0x03
+            Catomnum     = Int(hdr[3]); Latomnum = Int(hdr[4]); Ratomnum = Int(hdr[5])
+            TCpyCell     = Int(hdr[6])
+            order_max    = Int(hdr[7])
+
+            atv     = _read_packed_f64(io, TCpyCell+1)
+            atv_ijk = _read_packed_i32(io, TCpyCell+1)
+
+            TNO  = Int.(read!(io, Vector{Int32}(undef, atomnum)))
+            FNAN = Int.(read!(io, Vector{Int32}(undef, atomnum)))
+
+            natn = [Int.(read!(io, Vector{Int32}(undef, FNAN[i]+1))) for i in 1:atomnum]
+            ncn  = [Int.(read!(io, Vector{Int32}(undef, FNAN[i]+1))) for i in 1:atomnum]
+
+            tv  = _read_packed_f64(io, 3)
+            rtv = _read_packed_f64(io, 3)
+            gbuf = Vector{Float64}(undef, 4*atomnum); read!(io, gbuf)
+            G = reshape(gbuf, 4, atomnum); Gxyz = Matrix(G[2:4, :])
+
+            OLP = [Vector{Matrix{Float64}}(undef, FNAN[i]+1) for i in 1:atomnum]
+            for i in 1:atomnum, h in 1:(FNAN[i]+1)
+                B = natn[i][h]
+                OLP[i][h] = _read_block_f64(io, TNO[B], TNO[i])
+            end
+            OLP_r = ntuple(_->([Vector{Matrix{Float64}}(undef, FNAN[i]+1) for i in 1:atomnum]), 3)
+            for α in 1:3, i in 1:atomnum, h in 1:(FNAN[i]+1)
+                B = natn[i][h]
+                M = _read_block_f64(io, TNO[i], TNO[B])
+                OLP_r[α][i][h] = M'
+            end
+
+            return (; atomnum, spinP_switch, atv, atv_ijk, TNO, FNAN, natn, ncn,
+                    tv, rtv, Gxyz, OLP, OLP_r)
+        end
+    end
+
+    olpr = _read_olpr(joinpath(dir, "openmx_olpr.scfout"))
+
+    nm = TBModel{ComplexF64}(norbits, lat, isorthogonal=false)
+
+    # set overlaps and position matrices
+    for i in 1:olpr.atomnum, h in 1:(olpr.FNAN[i]+1)
+        jatom = olpr.natn[i][h]
+        R = olpr.atv_ijk[:, olpr.ncn[i][h]]
+        for ii in 1:olpr.TNO[i], jj in 1:olpr.TNO[jatom]
+            setoverlap!(nm, R, numorb_base[i] + ii, numorb_base[jatom] + jj,
+                        olpr.OLP[i][h][jj, ii])
+            for α in 1:3
+                setposition!(nm, R, numorb_base[i] + ii, numorb_base[jatom] + jj, α,
+                             olpr.OLP_r[α][i][h][jj, ii] * bohr_to_ang)
+            end
+        end
+    end
+
+    # read Hamiltonian predictions
+    hamfile = joinpath(dir, "hamiltonians_pred.h5")
+    HDF5.h5open(hamfile, "r") do f
+        function _walk(g, parts)
+            for name in keys(g)
+                obj = g[name]
+                if obj isa HDF5.Group
+                    _walk(obj, [parts...; name])
+                elseif obj isa HDF5.Dataset
+                    idx = parse.(Int, [parts...; name])
+                    i, j, k, ai, aj = idx
+                    mat = read(obj)
+                    close(obj)
+                    mat .*= hartree_to_ev
+                    basei = numorb_base[ai]
+                    basej = numorb_base[aj]
+                    for ii in 1:size(mat,2), jj in 1:size(mat,1)
+                        sethopping!(nm, [i,j,k], basei + ii, basej + jj, mat[jj, ii])
+                    end
+                end
+            end
+        end
+        _walk(f, String[])
+    end
+
+    return nm
 end
 
 
