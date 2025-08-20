@@ -635,6 +635,8 @@ function createmodeldeephopenmx(dir::String)
         M = reshape(buf, 4, num)
         Int.(M[2:4, :])
     end
+
+    #note column-major in julia while read in file is row-major
     function _read_block_f64(io, rows::Int, cols::Int)
         M = Matrix{Float64}(undef, rows, cols); read!(io, M); M
     end
