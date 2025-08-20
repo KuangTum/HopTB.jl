@@ -3,7 +3,9 @@ module Interface
 using StaticArrays, LinearAlgebra
 using ..HopTB
 using HDF5
-
+using JSON
+using Printf
+using DelimitedFiles
 export createmodelaims, createmodelopenmx, createmodelwannier, createmodeldeephopenmx
 
 # FHI-aims
@@ -215,6 +217,21 @@ function _parseopenmx(filepath::String)
         for i = dims; t = Vector{T}(undef, i);read!(f, t);push!(ret, t); end; ret
     end
 
+    """
+    atomnum::Int: NUMBER OF ATOM in unit cell (R=0)
+    SpinP_switch::Int：自旋模式（0,1,3；3 代表非共线/SOC）
+    atv::3×(TCpyCell+1)、atv_ijk::3×(TCpyCell+1)：平移向量及其整数索引
+    Total_NumOrbs::Vector{Int}：每个原子的轨道数
+    FNAN::Vector{Int}：每个原子“邻壳数”（注意已经 +1 含自我块）
+    natn::Vector{Vector{Int}}：每原子邻接原子索引（1-based）
+    ncn::Vector{Vector{Int}}：每原子邻接平移索引（1-based）
+    tv::3×3：实空间晶格
+    Hk::Vector{Vector{Vector{Matrix{T}}}}：哈密顿块（按 spin→中心原子→邻壳 的 3 层嵌套）
+    iHk::同上或 nothing：非共线情况下额外读入的虚部/自旋分量
+    OLP：重叠矩阵块
+    OLP_r::长度为3的数组：x/y/z 方向的位置算符块（已做原点修正）
+    """
+
     function read_matrix_in_mixed_matrix(::Type{T}, f, spins, atomnum, FNAN, natn, Total_NumOrbs) where T
         ret = Vector{Vector{Vector{Matrix{T}}}}(undef, spins)
         for spin = 1:spins;t_spin = Vector{Vector{Matrix{T}}}(undef, atomnum)
@@ -258,10 +275,38 @@ function _parseopenmx(filepath::String)
     iHk = SpinP_switch == 3 ? bound_read_matrix_in_mixed_matrix(3) : nothing
     OLP = bound_read_matrix_in_mixed_matrix(1)[1]
     OLP_r = []
+
+    
     for dir in 1:3, order in 1:order_max
         t = bound_read_matrix_in_mixed_matrix(1)[1]
         if order == 1 push!(OLP_r, t) end
     end
+
+    file_name = "OLP_r_first_matrix.txt"
+    open(file_name, "w") do file  # 打开文件以写入模式
+        for i in 1:atomnum
+            for j in 1:FNAN[i]    #in readin to start from 1
+                Gh_AN = natn[i][j]   # 获取邻居原子索引
+                Rn_AN = ncn[i][j] - 1   # 获取平移索引（1-based）
+                first_OLP_r = round.(OLP_r[1][i][j], digits=7)  # 控制到小数点后 7 位
+                write(file, "global index $i to global neighbor index $Gh_AN at Rn $Rn_AN ($(atv_ijk[1,ncn[i][j]]), $(atv_ijk[2,ncn[i][j]]), $(atv_ijk[3,ncn[i][j]])):\n")
+                
+                # 格式化输出矩阵
+                for row in eachrow(first_OLP_r)
+                    for (k, value) in enumerate(row)
+                        if k == length(row)
+                            @printf(file, "%9.7f\n", value)  # 行末尾换行
+                        else
+                            @printf(file, "%9.7f ", value)  # 每个值之间用空格分隔
+                        end
+                    end
+                end
+                write(file, "\n")  # 添加换行符
+            end
+        end
+    end
+
+
     OLP_p = bound_read_matrix_in_mixed_matrix(3)
     DM = bound_read_matrix_in_mixed_matrix(SpinP_switch + 1)
     iDM = bound_read_matrix_in_mixed_matrix(2)
@@ -304,7 +349,9 @@ function _parseopenmx(filepath::String)
     end
     atom_pos = tv * atom_frac_pos
     close(f)
-
+    println("fractional atom positions = ", atom_frac_pos)
+    println("absolute atom_pos (bohr) = ", atom_pos)
+    println("absolute atom_pos (Angtrom) = ", atom_pos * 0.529177249)
     # use the atom_pos to fix
     # TODO: Persuade wangc to accept the following code, which seems hopeless and meaningless.
     """
@@ -318,7 +365,12 @@ function _parseopenmx(filepath::String)
 
     # fix type mismatch
     atv_ijk = Matrix{Int16}(atv_ijk)
-
+    println("size atv from openm3.9 = ", size(atv))
+    println("size atv_ijk from openm3.9 = ", size(atv_ijk))
+    println("vales of atv_ijk = ", atv_ijk[1:3, 1:5])
+    println(" values of tv from openm3.9 (anstrom) = ", tv*0.529177249)
+    println("size of Total_NumOrbs", size(Total_NumOrbs))
+    println("values of Total_NumOrbs = ", Total_NumOrbs)
     return atomnum, SpinP_switch, atv, atv_ijk, Total_NumOrbs, FNAN, natn, ncn, tv, Hk, iHk, OLP, OLP_r
 end
 
@@ -337,7 +389,8 @@ function _parseopenmx38(filepath::String)
 
     function read_matrix_in_mixed_matrix(::Type{T}, f, spins, atomnum, FNAN, natn, Total_NumOrbs) where T
         ret = Vector{Vector{Vector{Matrix{T}}}}(undef, spins)
-        for spin = 1:spins;t_spin = Vector{Vector{Matrix{T}}}(undef, atomnum)
+        for spin = 1:spins;
+            t_spin = Vector{Vector{Matrix{T}}}(undef, atomnum)
             for ai = 1:atomnum;t_ai = Vector{Matrix{T}}(undef, FNAN[ai])
                 for aj_inner = 1:FNAN[ai]
                     t = Matrix{T}(undef, Total_NumOrbs[natn[ai][aj_inner]], Total_NumOrbs[ai])
@@ -438,6 +491,7 @@ function _createmodelopenmx_inner(filepath::String, parserfunc::Function)
 
     atomnum, SpinP_switch, atv, atv_ijk, Total_NumOrbs, FNAN, natn, ncn, tv, Hk, iHk, OLP, OLP_r = parserfunc(filepath)
     numorb_base = calcassistvars(Total_NumOrbs)
+    println("numorb_base = ", numorb_base)
     Total_NumOrbs_sum = sum(Total_NumOrbs)
     ((x)->x .*= 0.529177249).([atv, tv]) # Bohr to Ang
     atv = nothing # atv is never used actually
@@ -448,7 +502,29 @@ function _createmodelopenmx_inner(filepath::String, parserfunc::Function)
     end
     ((x)->((y)->((z)->z .*= 0.529177249).(y)).(x)).(OLP_r)
 
-
+    file_name = "origin_modifiOLP_r_first_matrix(Angstrom).txt"
+    open(file_name, "w") do file  # 打开文件以写入模式
+        for i in 1:atomnum
+            for j in 1:FNAN[i]    #in readin to start from 1
+                Gh_AN = natn[i][j]   # 获取邻居原子索引
+                Rn_AN = ncn[i][j] - 1   # 获取平移索引（1-based）
+                first_OLP_r = round.(OLP_r[1][i][j], digits=7)  # 控制到小数点后 7 位
+                write(file, "global index $i to global neighbor index $Gh_AN at Rn $Rn_AN ($(atv_ijk[1,ncn[i][j]]), $(atv_ijk[2,ncn[i][j]]), $(atv_ijk[3,ncn[i][j]])):\n")
+                
+                # 格式化输出矩阵
+                for row in eachrow(first_OLP_r)
+                    for (k, value) in enumerate(row)
+                        if k == length(row)
+                            @printf(file, "%9.7f\n", value)  # 行末尾换行
+                        else
+                            @printf(file, "%9.7f ", value)  # 每个值之间用空格分隔
+                        end
+                    end
+                end
+                write(file, "\n")  # 添加换行符
+            end
+        end
+    end
     # sethopping_Hatree(R,i,j,E)=sethopping!(nm,R,i,j,E*27.211399)
     # setposition_Bohr(R,i,j,alpha,r)=setposition!(nm,R,i,j,alpha,r*0.529177249)
 
@@ -530,31 +606,24 @@ All lengths are converted from Bohr to Å and energies from Hartree to eV.
 function createmodeldeephopenmx(dir::String)
     bohr_to_ang = 0.529177249
     hartree_to_ev = 27.211399
-    HDF5 = Base.require(:HDF5)
-
     # lattice vectors
     lat = zeros(Float64, 3, 3)
     open(joinpath(dir, "lat.dat")) do io
         for i in 1:3
-            lat[:, i] = parse.(Float64, split(readline(io)))
+            lat[i, :] = parse.(Float64, split(readline(io)))
         end
     end
-    lat .*= bohr_to_ang
-
-    # orbital numbers per atom
-    orb_lines = readlines(joinpath(dir, "orbital_types.dat"))
-    Total_NumOrbs = [length(split(strip(l))) for l in orb_lines]
-    numorb_base = cumsum([0; Total_NumOrbs[1:end-1]])
-    norbits = sum(Total_NumOrbs)
+    println("lattice vectors (angstrom) = ", lat)
 
     # atomic positions (currently unused, but parsed for completeness)
     pos_lines = readlines(joinpath(dir, "site_positions.dat"))
     natoms = length(split(pos_lines[1]))
-    Gxyz = zeros(Float64, 3, natoms)
+    println("number of atoms = ", natoms)
+    atom_pos = zeros(Float64, 3, natoms)
     for α in 1:3
-        Gxyz[α, :] = parse.(Float64, split(pos_lines[α])) * bohr_to_ang
+        atom_pos[α, :] = parse.(Float64, split(pos_lines[α]))
     end
-
+    println("atom positions (angstrom) = ", atom_pos)
     # helper functions to parse overlap scfout
     function _read_packed_f64(io, num)
         buf = Vector{Float64}(undef, 4*num); read!(io, buf)
@@ -569,6 +638,7 @@ function createmodeldeephopenmx(dir::String)
     function _read_block_f64(io, rows::Int, cols::Int)
         M = Matrix{Float64}(undef, rows, cols); read!(io, M); M
     end
+    # read overlap scfout and has same structure as _parseopenmx
     function _read_olpr(filepath::String)
         open(filepath, "r") do io
             hdr = Vector{Int32}(undef, 7); read!(io, hdr)
@@ -586,7 +656,7 @@ function createmodeldeephopenmx(dir::String)
 
             natn = [Int.(read!(io, Vector{Int32}(undef, FNAN[i]+1))) for i in 1:atomnum]
             ncn  = [Int.(read!(io, Vector{Int32}(undef, FNAN[i]+1))) for i in 1:atomnum]
-
+            ncn = ((x)->x .+ 1).(ncn) # These is to fix that atv and atv_ijk starts from 0 in original C code.
             tv  = _read_packed_f64(io, 3)
             rtv = _read_packed_f64(io, 3)
             gbuf = Vector{Float64}(undef, 4*atomnum); read!(io, gbuf)
@@ -600,57 +670,130 @@ function createmodeldeephopenmx(dir::String)
             OLP_r = ntuple(_->([Vector{Matrix{Float64}}(undef, FNAN[i]+1) for i in 1:atomnum]), 3)
             for α in 1:3, i in 1:atomnum, h in 1:(FNAN[i]+1)
                 B = natn[i][h]
-                M = _read_block_f64(io, TNO[i], TNO[B])
-                OLP_r[α][i][h] = M'
+                OLP_r[α][i][h] = _read_block_f64(io, TNO[B], TNO[i])
             end
 
+            FNAN .+= 1 # change index from 1-based
             return (; atomnum, spinP_switch, atv, atv_ijk, TNO, FNAN, natn, ncn,
                     tv, rtv, Gxyz, OLP, OLP_r)
         end
     end
 
     olpr = _read_olpr(joinpath(dir, "openmx_olpr.scfout"))
+    atomnum = olpr.atomnum
+    TNO     = olpr.TNO
+    FNAN    = olpr.FNAN
+    natn    = olpr.natn
+    ncn     = olpr.ncn
+    atv_ijk = olpr.atv_ijk
+    OLP     = olpr.OLP
+    OLP_r   = olpr.OLP_r
+    # transform unit from bohr to angstrom
+    ((x)->((y)->((z)->z .*= 0.529177249).(y)).(x)).(OLP_r)
+    #OLP_r goes to <0n|r-Ri|Rm> + Ri<0n|Rm>;codex also show openmx gives relative position
+    for axis in 1:3,i in 1:atomnum, j in 1:FNAN[i]
+        OLP_r[axis][i][j] .+= atom_pos[axis,i] * OLP[i][j]
+    end
 
+    Total_NumOrbs = olpr.TNO
+    numorb_base = cumsum([0; Total_NumOrbs[1:end-1]])
+    println("Total_NumOrbs = ", Total_NumOrbs)
+    println("numorb_base = ", numorb_base)
+    norbits = sum(Total_NumOrbs)
+    println("Total number of orbitals = ", norbits)
     nm = TBModel{ComplexF64}(norbits, lat, isorthogonal=false)
-
+    println("size of atv_ijk from overlap openm3.9 = ", size(olpr.atv_ijk))
+    
+    file_name = "origin_modify_OLP_r_first_matrix_read_olpopenmx.txt"
+    open(file_name, "w") do file  # 打开文件以写入模式
+        for i in 1:atomnum
+            for j in 1:FNAN[i]    #in readin to start from 1
+                Gh_AN = natn[i][j]   # 获取邻居原子索引
+                Rn_AN = ncn[i][j] - 1   # 获取平移索引（1-based）
+                first_OLP_r = round.(OLP_r[1][i][j], digits=7)  # 控制到小数点后 7 位
+                write(file, "global index $i to global neighbor index $Gh_AN at Rn $Rn_AN ($(atv_ijk[1,ncn[i][j]]), $(atv_ijk[2,ncn[i][j]]), $(atv_ijk[3,ncn[i][j]])):\n")
+                
+                # 格式化输出矩阵
+                for row in eachrow(first_OLP_r)
+                    for (k, value) in enumerate(row)
+                        if k == length(row)
+                            @printf(file, "%9.7f\n", value)  # 行末尾换行
+                        else
+                            @printf(file, "%9.7f ", value)  # 每个值之间用空格分隔
+                        end
+                    end
+                end
+                write(file, "\n")  # 添加换行符
+            end
+        end
+    end
     # set overlaps and position matrices
-    for i in 1:olpr.atomnum, h in 1:(olpr.FNAN[i]+1)
+    for i in 1:olpr.atomnum, h in 1:(olpr.FNAN[i])
         jatom = olpr.natn[i][h]
         R = olpr.atv_ijk[:, olpr.ncn[i][h]]
         for ii in 1:olpr.TNO[i], jj in 1:olpr.TNO[jatom]
             setoverlap!(nm, R, numorb_base[i] + ii, numorb_base[jatom] + jj,
                         olpr.OLP[i][h][jj, ii])
+        end
+    end
+    for i in 1:olpr.atomnum, h in 1:(olpr.FNAN[i])
+        jatom = olpr.natn[i][h]
+        R = olpr.atv_ijk[:, olpr.ncn[i][h]]
+        for ii in 1:olpr.TNO[i], jj in 1:olpr.TNO[jatom]
             for α in 1:3
                 setposition!(nm, R, numorb_base[i] + ii, numorb_base[jatom] + jj, α,
-                             olpr.OLP_r[α][i][h][jj, ii] * bohr_to_ang)
+                             olpr.OLP_r[α][i][h][jj, ii])
             end
         end
     end
 
-    # read Hamiltonian predictions
+   # --- helper: parse DeepH key ---
+# 支持 "[-1, -1, 0, 1, 19]" 或 "grp1/grp2/-1/-1/0/1/19"
+# 返回 (i,j,k,ai,aj) ，注意这里保持 DeepH 文件里的 1-based ai/aj（Julia 也是 1-based）
+# 解析 DeepH 键：支持 "[-1, -1, 0, 1, 19]" 或 "grp/-1/-1/0/1/19"
+# 返回 (i,j,k,ai,aj)；ai/aj 保持 1-based（Julia 也是 1-based）
+
     hamfile = joinpath(dir, "hamiltonians_pred.h5")
-    HDF5.h5open(hamfile, "r") do f
-        function _walk(g, parts)
-            for name in keys(g)
-                obj = g[name]
-                if obj isa HDF5.Group
-                    _walk(obj, [parts...; name])
-                elseif obj isa HDF5.Dataset
-                    idx = parse.(Int, [parts...; name])
-                    i, j, k, ai, aj = idx
-                    mat = read(obj)
-                    close(obj)
-                    mat .*= hartree_to_ev
-                    basei = numorb_base[ai]
-                    basej = numorb_base[aj]
-                    for ii in 1:size(mat,2), jj in 1:size(mat,1)
-                        sethopping!(nm, [i,j,k], basei + ii, basej + jj, mat[jj, ii])
+
+    try
+        HDF5.h5open(hamfile, "r") do f
+            function _walk(g, parts)
+                for name in keys(g)
+                    obj = g[name]
+                    if obj isa HDF5.Group
+                        _walk(obj, [parts...; name])
+                    elseif obj isa HDF5.Dataset
+                        try
+                            # Parse the dataset name as an array of integers
+                            idx = JSON.parse(name)  # Parses "[0, -2, 0, 1, 1]" into [0, -2, 0, 1, 1]
+                            i, j, k, ai, aj = idx
+                            mat = read(obj)
+                            basei = numorb_base[ai]
+                            basej = numorb_base[aj]
+                            # println("Matrix size: ", size(mat))
+                            # println("Total_NumOrbs[ai]: ", Total_NumOrbs[ai], ", Total_NumOrbs[aj]: ", Total_NumOrbs[aj])
+
+                            @assert (size(mat, 2) == Total_NumOrbs[ai] &&
+                                 size(mat, 1) == Total_NumOrbs[aj]) "Matrix size mismatch for $name"
+                            # println("\n")
+                            # # mat is alos column-major, so mat is same as Hk in _parseopenmx it is neighbor*center 
+                            #for ii in 1:size(mat, 2), jj in 1:size(mat, 1)
+                            for ii in 1:Total_NumOrbs[ai], jj in 1:Total_NumOrbs[aj]
+                                sethopping!(nm, [i, j, k], basei + ii, basej + jj, mat[jj, ii])
+                            end
+                        catch e
+                            println("Error processing dataset $name: $e")
+                        end
                     end
                 end
             end
+            _walk(f, [])
         end
-        _walk(f, String[])
+    catch e
+        println("Error reading HDF5 file: $e")
     end
+
+return nm
 
     return nm
 end
