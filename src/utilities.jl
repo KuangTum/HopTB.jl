@@ -1,6 +1,6 @@
 module Utilities
 
-using LinearAlgebra, Distributed, HCubature
+using LinearAlgebra, Distributed, HCubature, Spglib
 
 
 """
@@ -170,6 +170,244 @@ function constructmeshkpts(nkmesh::Vector{Int64}; offset::Vector{Float64}=[0.0, 
         ik += 1
     end
     return kpts.+offset
+end
+
+
+"""
+    construct_irreducible_kmesh(
+        lattice::AbstractMatrix{<:Real},
+        frac_positions::AbstractMatrix{<:Real},
+        atom_types::AbstractVector{<:Integer},
+        nkmesh::AbstractVector{<:Integer};
+        is_shift::NTuple{3,Bool}=(false, false, false),
+        symprec::Float64=1e-5,
+        spinful::Bool=false,
+    )
+
+Generate irreducible Monkhorst-Pack k-points and symmetry weights using Spglib.
+
+`lattice` columns are direct lattice vectors in angstrom, `frac_positions` are fractional
+coordinates (3 × Natoms), and `atom_types` lists atomic numbers. `nkmesh` gives the full
+grid size. `is_shift` controls half-grid shifts and `spinful` disables time-reversal.
+
+Returns `(kpts, weights)` where `kpts` is a `3 × N_ir` matrix in reduced coordinates and
+`weights` sums to one.
+"""
+function construct_irreducible_kmesh(
+    lattice::AbstractMatrix{<:Real},
+    frac_positions::AbstractMatrix{<:Real},
+    atom_types::AbstractVector{<:Integer},
+    nkmesh::AbstractVector{<:Integer};
+    is_shift::NTuple{3,Bool}=(false, false, false),
+    symprec::Float64=1e-5,
+    spinful::Bool=false,
+)
+    size(lattice) == (3, 3) || throw(ArgumentError("lattice must be 3×3."))
+    size(frac_positions, 1) == 3 || throw(ArgumentError("frac_positions must have 3 rows."))
+    length(atom_types) == size(frac_positions, 2) ||
+        throw(ArgumentError("atom_types length must match number of positions."))
+    length(nkmesh) == 3 || throw(ArgumentError("nkmesh must have length 3."))
+
+    mesh_vec = collect(Int.(nkmesh))
+    cell = Spglib.SpglibCell(lattice, frac_positions, Vector{Int}(atom_types))
+    bz = Spglib.get_ir_reciprocal_mesh(
+        cell,
+        mesh_vec,
+        symprec;
+        is_shift=collect(is_shift),
+        is_time_reversal=!spinful,
+    )
+
+    ir_indices = unique(bz.ir_mapping_table)
+    lookup = Dict(id => idx for (idx, id) in enumerate(ir_indices))
+    counts = zeros(Int, length(ir_indices))
+    for idx in bz.ir_mapping_table
+        counts[lookup[idx]] += 1
+    end
+
+    mesh_vec = Float64.(bz.mesh)
+    shift_vec = 0.5 .* Float64.(bz.is_shift)
+    kpts = Matrix{Float64}(undef, 3, length(ir_indices))
+    for (col, idx) in enumerate(ir_indices)
+        address = bz.grid_address[idx]
+        kpts[:, col] = (Float64.(address) .+ shift_vec) ./ mesh_vec
+    end
+
+    weights = counts ./ sum(counts)
+    return kpts, weights
+end
+
+
+function _hasfield(tm, name::Symbol)
+    return hasproperty(tm, name)
+end
+
+function _getfield_or_missing(tm, name::Symbol)
+    _hasfield(tm, name) ? getfield(tm, name) : missing
+end
+
+function _get_spinful(tm)
+    val = _getfield_or_missing(tm, :isspinful)
+    return ismissing(val) ? false : Bool(val)
+end
+
+function _get_site_positions(tm)
+    site_pos = _getfield_or_missing(tm, :site_positions)
+    return ismissing(site_pos) ? missing : Float64.(site_pos)
+end
+
+function _orbital_positions(tm)
+    positions_dict = _getfield_or_missing(tm, :positions)
+    ismissing(positions_dict) && error("orbital position matrices are not available for this model.")
+    R0_key = nothing
+    for R in keys(positions_dict)
+        if all(R .== 0)
+            R0_key = R
+            break
+        end
+    end
+    R0_key === nothing && error("model does not contain on-site position data (R = 0).")
+    blocks = positions_dict[R0_key]
+    norb = size(blocks[1], 1)
+    cart = Matrix{Float64}(undef, 3, norb)
+    for α in 1:3
+        block = blocks[α]
+        for i in 1:norb
+            cart[α, i] = real(block[i, i])
+        end
+    end
+    return cart
+end
+
+function _infer_site_types(tm, nsites::Int)
+    site_norbits = _getfield_or_missing(tm, :site_norbits)
+    orbital_types = _getfield_or_missing(tm, :orbital_types)
+    if ismissing(site_norbits) && ismissing(orbital_types)
+        return ones(Int, nsites)
+    end
+    actual_sites = if !ismissing(site_norbits)
+        length(site_norbits)
+    elseif !ismissing(orbital_types)
+        length(orbital_types)
+    else
+        nsites
+    end
+    signatures = Vector{Int}(undef, actual_sites)
+    cache = Dict{Any,Int}()
+    for i in 1:actual_sites
+        parts = Any[]
+        if !ismissing(site_norbits)
+            push!(parts, site_norbits[i])
+        end
+        if !ismissing(orbital_types)
+            push!(parts, Tuple(orbital_types[i]))
+        end
+        sig = isempty(parts) ? i : parts
+        signatures[i] = get!(cache, sig, length(cache) + 1)
+    end
+    return signatures
+end
+
+function _infer_orbital_types(tm, norb::Int)
+    site_norbits = _getfield_or_missing(tm, :site_norbits)
+    if ismissing(site_norbits)
+        return ones(Int, norb)
+    end
+    site_types = _infer_site_types(tm, length(site_norbits))
+    expanded = Int[]
+    for (stype, count) in zip(site_types, site_norbits)
+        append!(expanded, fill(stype, count))
+    end
+    return length(expanded) == norb ? expanded : ones(Int, norb)
+end
+
+function _cluster_positions(cart::AbstractMatrix{<:Real}, tol::Float64)
+    tol > 0 || error("cluster tolerance must be positive.")
+    scale = 1 / tol
+    unique = Vector{Vector{Float64}}()
+    keys = Dict{NTuple{3,Int64},Int}()
+    for j in 1:size(cart, 2)
+        key = ntuple(i -> round(Int64, cart[i, j] * scale), 3)
+        if !haskey(keys, key)
+            push!(unique, Float64.(cart[:, j]))
+            keys[key] = length(unique)
+        end
+    end
+    return isempty(unique) ? zeros(Float64, 3, 0) : hcat(unique...)
+end
+
+function _choose_positions(tm, mode::Symbol; cluster_tol::Float64=1e-2)
+    selected = mode
+    site_pos = _get_site_positions(tm)
+    if selected === :auto
+        selected = ismissing(site_pos) ? :orbital : :site
+    end
+    if selected === :site
+        !ismissing(site_pos) || error("site positions are missing; specify positions=:orbital.")
+        return site_pos, :site
+    elseif selected === :orbital
+        cart = _orbital_positions(tm)
+        clustered = _cluster_positions(cart, cluster_tol)
+        return clustered, :orbital
+    else
+        error("positions must be :auto, :site, or :orbital")
+    end
+end
+
+function _default_atom_types(tm, count::Int, which::Symbol)
+    if which === :site
+        types = _infer_site_types(tm, count)
+        return length(types) == count ? types : ones(Int, count)
+    else
+        types = _infer_orbital_types(tm, count)
+        return length(types) == count ? types : ones(Int, count)
+    end
+end
+
+"""
+    construct_irreducible_kmesh(
+        tm,
+        nkmesh::AbstractVector{<:Integer};
+        atom_types::Union{Nothing,AbstractVector{<:Integer}}=nothing,
+        positions::Symbol=:auto,
+        is_shift::NTuple{3,Bool}=(false, false, false),
+        symprec::Float64=1e-5,
+        spinful::Union{Nothing,Bool}=nothing,
+    )
+
+Convenience wrapper that infers lattice, atomic positions, and spin setting from a `TBModel`.
+
+`positions` chooses whether to use stored site positions (`:site`) or orbital centers (`:orbital`).
+The default `:auto` prefers site positions when available. If `atom_types` is omitted the helper
+derives species labels from site metadata when possible; otherwise all atoms are treated as the
+same species.
+"""
+function construct_irreducible_kmesh(
+    tm,
+    nkmesh::AbstractVector{<:Integer};
+    atom_types::Union{Nothing,AbstractVector{<:Integer}}=nothing,
+    positions::Symbol=:auto,
+    cluster_tol::Float64=1e-2,
+    is_shift::NTuple{3,Bool}=(false, false, false),
+    symprec::Float64=1e-5,
+    spinful::Union{Nothing,Bool}=nothing,
+)
+    lattice = Matrix(tm.lat)
+    cart_positions, mode = _choose_positions(tm, positions; cluster_tol=cluster_tol)
+    frac_positions = lattice \ cart_positions
+    species = atom_types === nothing ? _default_atom_types(tm, size(frac_positions, 2), mode) : Vector{Int}(atom_types)
+    length(species) == size(frac_positions, 2) ||
+        throw(ArgumentError("length of atom_types must equal number of positions."))
+    spinflag = isnothing(spinful) ? _get_spinful(tm) : spinful
+    return construct_irreducible_kmesh(
+        lattice,
+        frac_positions,
+        species,
+        nkmesh;
+        is_shift=is_shift,
+        symprec=symprec,
+        spinful=spinflag,
+    )
 end
 
 

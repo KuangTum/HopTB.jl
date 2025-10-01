@@ -282,29 +282,29 @@ function _parseopenmx(filepath::String)
         if order == 1 push!(OLP_r, t) end
     end
 
-    file_name = "OLP_r_first_matrix.txt"
-    open(file_name, "w") do file  # 打开文件以写入模式
-        for i in 1:atomnum
-            for j in 1:FNAN[i]    #in readin to start from 1
-                Gh_AN = natn[i][j]   # 获取邻居原子索引
-                Rn_AN = ncn[i][j] - 1   # 获取平移索引（1-based）
-                first_OLP_r = round.(OLP_r[1][i][j], digits=7)  # 控制到小数点后 7 位
-                write(file, "global index $i to global neighbor index $Gh_AN at Rn $Rn_AN ($(atv_ijk[1,ncn[i][j]]), $(atv_ijk[2,ncn[i][j]]), $(atv_ijk[3,ncn[i][j]])):\n")
+    # file_name = "OLP_r_first_matrix.txt"
+    # open(file_name, "w") do file  # 打开文件以写入模式
+    #     for i in 1:atomnum
+    #         for j in 1:FNAN[i]    #in readin to start from 1
+    #             Gh_AN = natn[i][j]   # 获取邻居原子索引
+    #             Rn_AN = ncn[i][j] - 1   # 获取平移索引（1-based）
+    #             first_OLP_r = round.(OLP_r[1][i][j], digits=7)  # 控制到小数点后 7 位
+    #             write(file, "global index $i to global neighbor index $Gh_AN at Rn $Rn_AN ($(atv_ijk[1,ncn[i][j]]), $(atv_ijk[2,ncn[i][j]]), $(atv_ijk[3,ncn[i][j]])):\n")
                 
-                # 格式化输出矩阵
-                for row in eachrow(first_OLP_r)
-                    for (k, value) in enumerate(row)
-                        if k == length(row)
-                            @printf(file, "%9.7f\n", value)  # 行末尾换行
-                        else
-                            @printf(file, "%9.7f ", value)  # 每个值之间用空格分隔
-                        end
-                    end
-                end
-                write(file, "\n")  # 添加换行符
-            end
-        end
-    end
+    #             # 格式化输出矩阵
+    #             for row in eachrow(first_OLP_r)
+    #                 for (k, value) in enumerate(row)
+    #                     if k == length(row)
+    #                         @printf(file, "%9.7f\n", value)  # 行末尾换行
+    #                     else
+    #                         @printf(file, "%9.7f ", value)  # 每个值之间用空格分隔
+    #                     end
+    #                 end
+    #             end
+    #             write(file, "\n")  # 添加换行符
+    #         end
+    #     end
+    # end
 
 
     OLP_p = bound_read_matrix_in_mixed_matrix(3)
@@ -502,29 +502,29 @@ function _createmodelopenmx_inner(filepath::String, parserfunc::Function)
     end
     ((x)->((y)->((z)->z .*= 0.529177249).(y)).(x)).(OLP_r)
 
-    file_name = "origin_modifiOLP_r_first_matrix(Angstrom).txt"
-    open(file_name, "w") do file  # 打开文件以写入模式
-        for i in 1:atomnum
-            for j in 1:FNAN[i]    #in readin to start from 1
-                Gh_AN = natn[i][j]   # 获取邻居原子索引
-                Rn_AN = ncn[i][j] - 1   # 获取平移索引（1-based）
-                first_OLP_r = round.(OLP_r[1][i][j], digits=7)  # 控制到小数点后 7 位
-                write(file, "global index $i to global neighbor index $Gh_AN at Rn $Rn_AN ($(atv_ijk[1,ncn[i][j]]), $(atv_ijk[2,ncn[i][j]]), $(atv_ijk[3,ncn[i][j]])):\n")
+    # file_name = "origin_modifiOLP_r_first_matrix(Angstrom).txt"
+    # open(file_name, "w") do file  # 打开文件以写入模式
+    #     for i in 1:atomnum
+    #         for j in 1:FNAN[i]    #in readin to start from 1
+    #             Gh_AN = natn[i][j]   # 获取邻居原子索引
+    #             Rn_AN = ncn[i][j] - 1   # 获取平移索引（1-based）
+    #             first_OLP_r = round.(OLP_r[1][i][j], digits=7)  # 控制到小数点后 7 位
+    #             write(file, "global index $i to global neighbor index $Gh_AN at Rn $Rn_AN ($(atv_ijk[1,ncn[i][j]]), $(atv_ijk[2,ncn[i][j]]), $(atv_ijk[3,ncn[i][j]])):\n")
                 
-                # 格式化输出矩阵
-                for row in eachrow(first_OLP_r)
-                    for (k, value) in enumerate(row)
-                        if k == length(row)
-                            @printf(file, "%9.7f\n", value)  # 行末尾换行
-                        else
-                            @printf(file, "%9.7f ", value)  # 每个值之间用空格分隔
-                        end
-                    end
-                end
-                write(file, "\n")  # 添加换行符
-            end
-        end
-    end
+    #             # 格式化输出矩阵
+    #             for row in eachrow(first_OLP_r)
+    #                 for (k, value) in enumerate(row)
+    #                     if k == length(row)
+    #                         @printf(file, "%9.7f\n", value)  # 行末尾换行
+    #                     else
+    #                         @printf(file, "%9.7f ", value)  # 每个值之间用空格分隔
+    #                     end
+    #                 end
+    #             end
+    #             write(file, "\n")  # 添加换行符
+    #         end
+    #     end
+    # end
     # sethopping_Hatree(R,i,j,E)=sethopping!(nm,R,i,j,E*27.211399)
     # setposition_Bohr(R,i,j,alpha,r)=setposition!(nm,R,i,j,alpha,r*0.529177249)
 
@@ -706,29 +706,29 @@ function createmodeldeephopenmx(dir::String)
     nm = TBModel{ComplexF64}(norbits, lat, isorthogonal=false)
     println("size of atv_ijk from overlap openm3.9 = ", size(olpr.atv_ijk))
     
-    file_name = "origin_modify_OLP_r_first_matrix_read_olpopenmx.txt"
-    open(file_name, "w") do file  # 打开文件以写入模式
-        for i in 1:atomnum
-            for j in 1:FNAN[i]    #in readin to start from 1
-                Gh_AN = natn[i][j]   # 获取邻居原子索引
-                Rn_AN = ncn[i][j] - 1   # 获取平移索引（1-based）
-                first_OLP_r = round.(OLP_r[1][i][j], digits=7)  # 控制到小数点后 7 位
-                write(file, "global index $i to global neighbor index $Gh_AN at Rn $Rn_AN ($(atv_ijk[1,ncn[i][j]]), $(atv_ijk[2,ncn[i][j]]), $(atv_ijk[3,ncn[i][j]])):\n")
+    # file_name = "origin_modify_OLP_r_first_matrix_read_olpopenmx.txt"
+    # open(file_name, "w") do file  # 打开文件以写入模式
+    #     for i in 1:atomnum
+    #         for j in 1:FNAN[i]    #in readin to start from 1
+    #             Gh_AN = natn[i][j]   # 获取邻居原子索引
+    #             Rn_AN = ncn[i][j] - 1   # 获取平移索引（1-based）
+    #             first_OLP_r = round.(OLP_r[1][i][j], digits=7)  # 控制到小数点后 7 位
+    #             write(file, "global index $i to global neighbor index $Gh_AN at Rn $Rn_AN ($(atv_ijk[1,ncn[i][j]]), $(atv_ijk[2,ncn[i][j]]), $(atv_ijk[3,ncn[i][j]])):\n")
                 
-                # 格式化输出矩阵
-                for row in eachrow(first_OLP_r)
-                    for (k, value) in enumerate(row)
-                        if k == length(row)
-                            @printf(file, "%9.7f\n", value)  # 行末尾换行
-                        else
-                            @printf(file, "%9.7f ", value)  # 每个值之间用空格分隔
-                        end
-                    end
-                end
-                write(file, "\n")  # 添加换行符
-            end
-        end
-    end
+    #             # 格式化输出矩阵
+    #             for row in eachrow(first_OLP_r)
+    #                 for (k, value) in enumerate(row)
+    #                     if k == length(row)
+    #                         @printf(file, "%9.7f\n", value)  # 行末尾换行
+    #                     else
+    #                         @printf(file, "%9.7f ", value)  # 每个值之间用空格分隔
+    #                     end
+    #                 end
+    #             end
+    #             write(file, "\n")  # 添加换行符
+    #         end
+    #     end
+    # end
     # set overlaps and position matrices
     for i in 1:olpr.atomnum, h in 1:(olpr.FNAN[i])
         jatom = olpr.natn[i][h]
@@ -797,6 +797,9 @@ function createmodeldeephopenmx(dir::String)
 
 return nm
 
+    nm.nsites = atomnum
+    nm.site_norbits = Vector{Int16}(Total_NumOrbs)
+    nm.site_positions = atom_pos
     return nm
 end
 
