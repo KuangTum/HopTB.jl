@@ -603,9 +603,10 @@ The directory `dir` is expected to contain:
 
 All lengths are converted from Bohr to Å and energies from Hartree to eV.
 """
-function createmodeldeephopenmx(dir::String)
+function createmodeldeephopenmx(dir::String; sparse::Bool=false)
     bohr_to_ang = 0.529177249
     hartree_to_ev = 27.211399
+    verbose = get(ENV, "HOPTB_VERBOSE", "false") == "true"
     # lattice vectors
     lat = zeros(Float64, 3, 3)
     open(joinpath(dir, "lat.dat")) do io
@@ -613,17 +614,17 @@ function createmodeldeephopenmx(dir::String)
             lat[i, :] = parse.(Float64, split(readline(io)))
         end
     end
-    println("lattice vectors (angstrom) = ", lat)
+    verbose && println("lattice vectors (angstrom) = ", lat)
 
     # atomic positions (currently unused, but parsed for completeness)
     pos_lines = readlines(joinpath(dir, "site_positions.dat"))
     natoms = length(split(pos_lines[1]))
-    println("number of atoms = ", natoms)
+    verbose && println("number of atoms = ", natoms)
     atom_pos = zeros(Float64, 3, natoms)
     for α in 1:3
         atom_pos[α, :] = parse.(Float64, split(pos_lines[α]))
     end
-    println("atom positions (angstrom) = ", atom_pos)
+    verbose && println("atom positions (angstrom) = ", atom_pos)
     # helper functions to parse overlap scfout
     function _read_packed_f64(io, num)
         buf = Vector{Float64}(undef, 4*num); read!(io, buf)
@@ -699,12 +700,16 @@ function createmodeldeephopenmx(dir::String)
 
     Total_NumOrbs = olpr.TNO
     numorb_base = cumsum([0; Total_NumOrbs[1:end-1]])
-    println("Total_NumOrbs = ", Total_NumOrbs)
-    println("numorb_base = ", numorb_base)
+    verbose && println("Total_NumOrbs = ", Total_NumOrbs)
+    verbose && println("numorb_base = ", numorb_base)
     norbits = sum(Total_NumOrbs)
-    println("Total number of orbitals = ", norbits)
-    nm = TBModel{ComplexF64}(norbits, lat, isorthogonal=false)
-    println("size of atv_ijk from overlap openm3.9 = ", size(olpr.atv_ijk))
+    verbose && println("Total number of orbitals = ", norbits)
+    if sparse
+        nm = SparseTBModel{ComplexF64}(norbits, lat, isorthogonal=false)
+    else
+        nm = TBModel{ComplexF64}(norbits, lat, isorthogonal=false)
+    end
+    verbose && println("size of atv_ijk from overlap openm3.9 = ", size(olpr.atv_ijk))
     
     # file_name = "origin_modify_OLP_r_first_matrix_read_olpopenmx.txt"
     # open(file_name, "w") do file  # 打开文件以写入模式
@@ -794,9 +799,6 @@ function createmodeldeephopenmx(dir::String)
     catch e
         println("Error reading HDF5 file: $e")
     end
-
-return nm
-
     nm.nsites = atomnum
     nm.site_norbits = Vector{Int16}(Total_NumOrbs)
     nm.site_positions = atom_pos
