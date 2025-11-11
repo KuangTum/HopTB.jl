@@ -1,6 +1,6 @@
 using SharedArrays, StaticArrays
 
-export AbstractTBModel, TBModel, SharedTBModel
+export AbstractTBModel, TBModel, SharedTBModel, SparseTBModel
 export sethopping!, addhopping!, setoverlap!, setposition!, set_orbital_types!, set_is_canonical_ordered!
 export gethopping, changebasis
 

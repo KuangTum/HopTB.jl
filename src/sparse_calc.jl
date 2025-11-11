@@ -1,0 +1,324 @@
+module SparseCalc
+
+using LinearAlgebra
+using SparseArrays
+using Arpack
+
+using ..HopTB
+using ..HopTB: AbstractTBModel
+using ..HopTB.Memoize: @memoize
+
+export PartialHermEig, eigs_near, eigs_window, pardiso_available
+
+const DEFAULT_DENSE_THRESHOLD = 64
+const DEFAULT_PARDISO_MIN_SIZE = 96
+const DEFAULT_SOLVER = :auto
+
+const _pardiso_supported = Ref(true)
+const _pardiso_available = Ref(false)
+const _pardiso_init_error = Ref{Union{Nothing,Exception}}(nothing)
+
+let pkg_path = Base.find_package("Pardiso")
+    if pkg_path === nothing
+        _pardiso_supported[] = false
+        _pardiso_available[] = false
+    else
+        try
+            @eval import Pardiso
+            _pardiso_available[] = Pardiso.mkl_is_available()
+        catch err
+            _pardiso_supported[] = false
+            _pardiso_available[] = false
+            _pardiso_init_error[] = err
+        end
+    end
+end
+
+_pardiso_active() = _pardiso_supported[] && _pardiso_available[]
+
+function pardiso_available()
+    return _pardiso_active()
+end
+
+struct PartialHermEig
+    values::Vector{Float64}
+    vectors::Matrix{ComplexF64}
+    residuals::Vector{Float64}
+    reference::Float64
+end
+
+Base.length(spec::PartialHermEig) = length(spec.values)
+Base.size(spec::PartialHermEig) = (size(spec.vectors, 1), length(spec))
+
+function Base.iterate(spec::PartialHermEig)
+    return (spec.values, Val(:vectors))
+end
+
+function Base.iterate(spec::PartialHermEig, ::Val{:vectors})
+    return (spec.vectors, Val(:residuals))
+end
+
+function Base.iterate(spec::PartialHermEig, ::Val{:residuals})
+    return (spec.residuals, Val(:reference))
+end
+
+function Base.iterate(spec::PartialHermEig, ::Val{:reference})
+    return (spec.reference, Val(:done))
+end
+
+Base.iterate(::PartialHermEig, ::Val{:done}) = nothing
+
+function PartialHermEig(values::Vector{Float64}, vectors::Matrix{ComplexF64},
+    residuals::Vector{Float64}, reference::Real)
+    nstates = length(values)
+    nstates == size(vectors, 2) || throw(ArgumentError("vectors must have one column per eigenvalue."))
+    nstates == length(residuals) ||
+        throw(ArgumentError("residuals must have the same length as values."))
+    return PartialHermEig(values, vectors, residuals, Float64(reference))
+end
+
+function _dense_eigs(tm::AbstractTBModel, k::AbstractVector{<:Real},
+    reference::Float64, window::Union{Nothing,Real})::PartialHermEig
+    spec = HopTB.geteig(tm, k)
+    energies = Float64.(spec.values)
+    order = sortperm(abs.(energies .- reference))
+    energies = energies[order]
+    vectors = spec.vectors[:, order]
+    residuals = zeros(Float64, length(energies))
+    if window !== nothing
+        win = Float64(window)
+        mask = abs.(energies .- reference) .<= win
+        energies = energies[mask]
+        vectors = vectors[:, mask]
+        residuals = residuals[mask]
+    end
+    return PartialHermEig(energies, vectors, residuals, reference)
+end
+
+function _compute_residuals(H::AbstractMatrix{<:Complex}, S::Union{Nothing,AbstractMatrix{<:Complex}},
+    eigenvals::Vector{Float64}, eigenvecs::Matrix{ComplexF64})::Vector{Float64}
+    nstates = length(eigenvals)
+    residuals = similar(eigenvals)
+    if S === nothing
+        for (icol, λ) in enumerate(eigenvals)
+            residuals[icol] = norm(H * view(eigenvecs, :, icol) - λ * view(eigenvecs, :, icol))
+        end
+    else
+        for (icol, λ) in enumerate(eigenvals)
+            residuals[icol] = norm(H * view(eigenvecs, :, icol) - λ * (S * view(eigenvecs, :, icol)))
+        end
+    end
+    return residuals
+end
+
+_pardiso_matrixtype(::Type{<:Real}) = Pardiso.REAL_SYM_INDEF
+_pardiso_matrixtype(::Type{<:Complex}) = Pardiso.COMPLEX_HERM_INDEF
+
+struct PardisoShiftOp
+    solver
+    matrix
+    rhs_buffer::Vector{ComplexF64}
+    S::Union{Nothing,Matrix{ComplexF64}}
+    dummy::Vector{ComplexF64}
+    n::Int
+end
+
+_pardiso_cleanup!(op::PardisoShiftOp) = begin
+    Pardiso.set_phase!(op.solver, Pardiso.RELEASE_ALL)
+    Pardiso.pardiso(op.solver, op.matrix, op.dummy)
+    return nothing
+end
+
+function Base.size(op::PardisoShiftOp)
+    return (op.n, op.n)
+end
+
+function Base.size(op::PardisoShiftOp, dim::Int)
+    if dim == 1 || dim == 2
+        return op.n
+    end
+    return 1
+end
+
+Base.eltype(::Type{PardisoShiftOp}) = ComplexF64
+
+function LinearAlgebra.mul!(y::AbstractVector{ComplexF64}, op::PardisoShiftOp, x::AbstractVector{ComplexF64})
+    if op.S === nothing
+        copyto!(op.rhs_buffer, x)
+    else
+        mul!(op.rhs_buffer, op.S, x)
+    end
+    Pardiso.set_phase!(op.solver, Pardiso.SOLVE_ITERATIVE_REFINE)
+    Pardiso.pardiso(op.solver, y, op.matrix, op.rhs_buffer)
+    return y
+end
+
+function Base.:*(op::PardisoShiftOp, x::AbstractVector{ComplexF64})
+    y = similar(x)
+    mul!(y, op, x)
+    return y
+end
+
+function _to_sparse(mat)
+    if mat isa SparseMatrixCSC
+        return copy(mat)
+    else
+        return sparse(mat)
+    end
+end
+
+function _build_pardiso_linear_operator(H::AbstractMatrix{ComplexF64},
+    S::Union{Nothing,AbstractMatrix{ComplexF64}}, sigma::Float64)::PardisoShiftOp
+    n = size(H, 1)
+    Hsp = _to_sparse(H)
+    if S === nothing
+        shift = copy(Hsp)
+        shift .-= sigma * spdiagm(0 => fill(ComplexF64(1.0), n))
+    else
+        Ssp = _to_sparse(S)
+        shift = Hsp - sigma * Ssp
+    end
+    A = shift
+    solver = Pardiso.MKLPardisoSolver()
+    Pardiso.set_matrixtype!(solver, _pardiso_matrixtype(eltype(A)))
+    Pardiso.pardisoinit(solver)
+    Pardiso.fix_iparm!(solver, :N)
+    Ap = Pardiso.get_matrix(solver, A, :N)
+    dummy = zeros(ComplexF64, n)
+    Pardiso.set_phase!(solver, Pardiso.ANALYSIS)
+    Pardiso.pardiso(solver, Ap, dummy)
+    Pardiso.set_phase!(solver, Pardiso.NUM_FACT)
+    Pardiso.pardiso(solver, Ap, dummy)
+    rhs_buffer = zeros(ComplexF64, n)
+    return PardisoShiftOp(solver, Ap, rhs_buffer, S, dummy, n)
+end
+
+function _arpack_eigs_pardiso(H::Matrix{ComplexF64},
+    S::Union{Nothing,Matrix{ComplexF64}}, nev::Int,
+    sigma::Float64, ncv::Int, tol::Float64, maxiter::Int)
+    op = _build_pardiso_linear_operator(H, S, sigma)
+    try
+        vals, vecs, nconv, niter, nmult, resid = Arpack.eigs(op; nev=nev, which=:LM,
+            tol=tol, maxiter=maxiter, ncv=ncv)
+        if nconv == 0
+            return vals, vecs, nconv, niter, nmult, resid
+        end
+        λs = sigma .+ inv.(vals[1:nconv])
+        vecs = vecs[:, 1:nconv]
+        return λs, vecs, nconv, niter, nmult, resid
+    finally
+        _pardiso_cleanup!(op)
+    end
+end
+
+function _arpack_eigs_native(H::Hermitian{ComplexF64,Matrix{ComplexF64}},
+    S::Union{Nothing,Hermitian{ComplexF64,Matrix{ComplexF64}}}, nev::Int,
+    sigma::Float64, ncv::Union{Nothing,Int}, tol::Float64, maxiter::Int)
+    kwargs = (; nev=nev, sigma=sigma, which=:LM, tol=tol, maxiter=maxiter)
+    if ncv !== nothing
+        kwargs = merge(kwargs, (; ncv=ncv))
+    end
+    if S === nothing
+        return Arpack.eigs(H; kwargs...)
+    else
+        return Arpack.eigs(H, S; kwargs...)
+    end
+end
+
+function _arpack_eigs(H::Matrix{ComplexF64}, S::Union{Nothing,Matrix{ComplexF64}},
+    nev::Int, sigma::Float64, ncv::Union{Nothing,Int}, tol::Float64, maxiter::Int,
+    solver::Symbol, pardiso_min_size::Int, fallback_full::Bool)
+    size(H, 1) == size(H, 2) || error("H must be square.")
+    solver_choice = solver
+    if solver_choice === :auto
+        solver_choice = (_pardiso_active() && sigma !== nothing && size(H, 1) >= pardiso_min_size) ? :pardiso : :native
+    end
+    if solver_choice === :pardiso
+        @debug "Using Pardiso shift-invert solver" size=size(H, 1)
+        try
+            ncv_eff = ncv === nothing ? min(size(H, 1), max(2 * nev + 2, 20)) : min(size(H, 1), Int(ncv))
+            return _arpack_eigs_pardiso(H, S, nev, sigma, ncv_eff, tol, maxiter)
+        catch err
+            if !fallback_full
+                rethrow(err)
+            end
+            @warn "Pardiso-based shift-invert failed; falling back to native solver." exception=(err, catch_backtrace())
+            solver_choice = :native
+        end
+    end
+    ncv_native = ncv === nothing ? nothing : min(size(H, 1), Int(ncv))
+    Hherm = Hermitian(H)
+    Sherm = S === nothing ? nothing : Hermitian(S)
+    return _arpack_eigs_native(Hherm, Sherm, nev, sigma, ncv_native, tol, maxiter)
+end
+
+@memoize k function eigs_near(tm::AbstractTBModel, k::AbstractVector{<:Real},
+    reference::Real; nev::Integer=8, window::Union{Nothing,Real}=nothing,
+    ncv::Union{Nothing,Integer}=nothing, sigma::Union{Nothing,Real}=nothing,
+    tol::Real=sqrt(eps(Float64)), maxiter::Integer=800,
+    compute_residuals::Bool=false, dense_cutoff::Integer=DEFAULT_DENSE_THRESHOLD,
+    fallback_full::Bool=true, solver::Symbol=DEFAULT_SOLVER,
+    pardiso_min_size::Integer=DEFAULT_PARDISO_MIN_SIZE)::PartialHermEig
+    n = tm.norbits
+    neff = clamp(Int(nev), 1, n)
+    densethresh = clamp(Int(dense_cutoff), 1, n)
+    ref = Float64(reference)
+    if fallback_full && (n <= densethresh || neff >= n)
+        return _dense_eigs(tm, k, ref, window)
+    end
+    Hmat = HopTB.getH(tm, k)
+    Smat = tm.isorthogonal ? nothing : HopTB.getS(tm, k)
+    sigma_val = sigma === nothing ? ref : Float64(sigma)
+    vals, vecs, nconv, niter, nmult, resid = _arpack_eigs(Hmat, Smat, neff, sigma_val,
+        ncv, Float64(tol), Int(maxiter), solver, Int(pardiso_min_size), fallback_full)
+    if nconv == 0
+        if fallback_full
+            return _dense_eigs(tm, k, ref, window)
+        else
+            error("ARPACK failed to converge for k-point; no eigenpairs obtained.")
+        end
+    end
+    energies = Float64.(real(vals[1:nconv]))
+    vecs = vecs[:, 1:nconv]
+    order = sortperm(abs.(energies .- ref))
+    energies = energies[order]
+    vecs = vecs[:, order]
+    compute_res = compute_residuals ? _compute_residuals(Hmat, Smat, energies, vecs) :
+        fill(NaN, length(energies))
+    if window !== nothing
+        win = Float64(window)
+        mask = abs.(energies .- ref) .<= win
+        energies = energies[mask]
+        vecs = vecs[:, mask]
+        compute_res = compute_res[mask]
+    end
+    return PartialHermEig(energies, vecs, compute_res, ref)
+end
+
+function eigs_window(tm::AbstractTBModel, k::AbstractVector{<:Real}, reference::Real,
+    window::Real; nev::Integer=8, min_states::Integer=2, max_tries::Integer=6,
+    growth_factor::Real=1.5, kwargs...)::PartialHermEig
+    n = tm.norbits
+    target = clamp(Int(min_states), 1, n)
+    current_nev = clamp(Int(nev), 1, n)
+    tries = 0
+    last_spec = nothing
+    while tries < max_tries
+        spec = eigs_near(tm, k, reference; nev=current_nev, window=window, kwargs...)
+        if length(spec) >= target || current_nev >= n
+            return spec
+        end
+        tries += 1
+        last_spec = spec
+        current_nev = min(n, max(current_nev + 1, Int(cld(current_nev * growth_factor, 1))))
+        if current_nev >= n
+            break
+        end
+    end
+    if last_spec === nothing
+        return eigs_near(tm, k, reference; nev=current_nev, window=window, kwargs...)
+    end
+    return last_spec
+end
+
+end

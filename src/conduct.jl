@@ -3,6 +3,7 @@ module Conduct
 using LinearAlgebra, Distributed
 import Spglib
 using ..HopTB
+using ..HopTB.SparseCalc: PartialHermEig, eigs_near, eigs_window
 using ..HopTB.Utilities:
     fermidirac,
     dfermi_dE,
@@ -243,6 +244,77 @@ end
 
 const VELOCITY_DEGENERACY_EPS = 1e-7
 
+const DEFAULT_SPARSE_OPTS = (
+    use_sparse = false,
+    window = nothing,
+    nev = 16,
+    min_states = 6,
+    max_tries = 4,
+    growth_factor = 1.5,
+    tol = sqrt(eps(Float64)),
+    maxiter = 800,
+    dense_cutoff = 64,
+    fallback_full = true,
+)
+
+function _normalize_sparse_opts(opts)
+    window = opts.window
+    if window !== nothing
+        window = Float64(window)
+        window < 0 && (window = abs(window))
+    end
+    return (
+        use_sparse = opts.use_sparse,
+        window = window,
+        nev = max(1, Int(opts.nev)),
+        min_states = max(0, Int(opts.min_states)),
+        max_tries = max(0, Int(opts.max_tries)),
+        growth_factor = max(1.0, Float64(opts.growth_factor)),
+        tol = max(0.0, Float64(opts.tol)),
+        maxiter = max(1, Int(opts.maxiter)),
+        dense_cutoff = max(1, Int(opts.dense_cutoff)),
+        fallback_full = Bool(opts.fallback_full),
+    )
+end
+
+function _ac_get_sparse_spec(
+    tm::AbstractTBModel,
+    k::AbstractVector{<:Real},
+    μ::Real,
+    opts
+)
+    opts.use_sparse || return nothing
+    μval = Float64(μ)
+    if opts.window !== nothing && opts.min_states > 0
+        return eigs_window(
+            tm,
+            k,
+            μval,
+            opts.window;
+            nev = opts.nev,
+            min_states = opts.min_states,
+            max_tries = opts.max_tries,
+            growth_factor = opts.growth_factor,
+            tol = opts.tol,
+            maxiter = opts.maxiter,
+            dense_cutoff = opts.dense_cutoff,
+            fallback_full = opts.fallback_full,
+        )
+    else
+        return eigs_near(
+            tm,
+            k,
+            μval;
+            nev = opts.nev,
+            window = opts.window,
+            tol = opts.tol,
+            maxiter = opts.maxiter,
+            dense_cutoff = opts.dense_cutoff,
+            fallback_full = opts.fallback_full,
+        )
+    end
+end
+
 function _mesh_kwargs_dict(mesh_kwargs)
     return isempty(mesh_kwargs) ? Dict{Symbol,Any}() : Dict{Symbol,Any}(mesh_kwargs)
 end
@@ -481,23 +553,56 @@ function _symmetrize_conductivity_tensor_2d(σ::Array{ComplexF64,3}, rotations::
 end
 
 function AC_tensor_worker(job::Tuple{Matrix{Float64},Vector{Float64}}, tm::AbstractTBModel,
-    ωs::Vector{Float64}, T::Float64, μ::Float64, δ::Float64)
+    ωs::Vector{Float64}, T::Float64, μ::Float64, δ::Float64, sparse_opts, delta_window)
     kpts, weights = job
     nω = length(ωs)
     result = zeros(ComplexF64, 3, 3, nω)
     velocity_products = Matrix{ComplexF64}(undef, 3, 3)
     prefactors = Vector{ComplexF64}(undef, nω)
     imδ = im * δ
+    energy_window = sparse_opts.window
     for (ik, w) in enumerate(weights)
         k = kpts[:, ik]
-        velocities = ntuple(α -> getvelocity(tm, α, k), 3)
-        egvals, _ = geteig(tm, k)
-        for n in 1:tm.norbits
+        spec = _ac_get_sparse_spec(tm, k, μ, sparse_opts)
+        if spec === nothing
+            eig = geteig(tm, k)
+            egvals = eig.values
+            velocities = ntuple(α -> getvelocity(tm, α, k), 3)
+            if energy_window !== nothing
+                mask = abs.(egvals .- μ) .<= energy_window
+                if !any(mask)
+                    continue
+                end
+                idxs = findall(mask)
+                egvals = egvals[idxs]
+                velocities = ntuple(α -> velocities[α][idxs, idxs], 3)
+            end
+        else
+            egvals = spec.values
+            if isempty(egvals)
+                continue
+            end
+            vecs = spec.vectors
+            if energy_window !== nothing
+                mask = abs.(egvals .- μ) .<= energy_window
+                if !any(mask)
+                    continue
+                end
+                egvals = egvals[mask]
+                vecs = vecs[:, mask]
+            end
+            velocities = ntuple(α -> getvelocity(tm, α, k, egvals, vecs), 3)
+        end
+        nstates = length(egvals)
+        for n in 1:nstates
             ϵn = egvals[n]
             fn = fermidirac(T, ϵn - μ)
-            for m in 1:tm.norbits
+            for m in 1:nstates
                 ϵm = egvals[m]
                 Δ = ϵn - ϵm
+                if delta_window !== nothing && abs(Δ) > delta_window
+                    continue
+                end
                 for α in 1:3, β in 1:3
                     velocity_products[α, β] = velocities[α][n, m] * velocities[β][m, n]
                 end
@@ -524,24 +629,61 @@ function AC_tensor_worker(job::Tuple{Matrix{Float64},Vector{Float64}}, tm::Abstr
 end
 
 function AC_tensor_worker_2d(job::Tuple{Matrix{Float64},Vector{Float64}}, tm::AbstractTBModel,
-    ωs::Vector{Float64}, T::Float64, μ::Float64, δ::Float64)
+    ωs::Vector{Float64}, T::Float64, μ::Float64, δ::Float64, sparse_opts, delta_window)
     kpts, weights = job
     nω = length(ωs)
     result = zeros(ComplexF64, 2, 2, nω)
     velocity_products = Matrix{ComplexF64}(undef, 2, 2)
     prefactors = Vector{ComplexF64}(undef, nω)
     imδ = im * δ
+    energy_window = sparse_opts.window
     for (ik, w) in enumerate(weights)
         k = kpts[:, ik]
-        v1 = getvelocity(tm, 1, k)
-        v2 = getvelocity(tm, 2, k)
-        egvals, _ = geteig(tm, k)
-        for n in 1:tm.norbits
+        spec = _ac_get_sparse_spec(tm, k, μ, sparse_opts)
+        if spec === nothing
+            eig = geteig(tm, k)
+            egvals = eig.values
+            vecs = eig.vectors
+            if energy_window !== nothing
+                mask = abs.(egvals .- μ) .<= energy_window
+                if !any(mask)
+                    continue
+                end
+                egvals = egvals[mask]
+                vecs = vecs[:, mask]
+                v1 = getvelocity_formula(tm, 1, k, egvals, vecs)
+                v2 = getvelocity_formula(tm, 2, k, egvals, vecs)
+            else
+                v1 = getvelocity(tm, 1, k)
+                v2 = getvelocity(tm, 2, k)
+            end
+        else
+            egvals = spec.values
+            if isempty(egvals)
+                continue
+            end
+            vecs = spec.vectors
+            if energy_window !== nothing
+                mask = abs.(egvals .- μ) .<= energy_window
+                if !any(mask)
+                    continue
+                end
+                egvals = egvals[mask]
+                vecs = vecs[:, mask]
+            end
+            v1 = getvelocity_formula(tm, 1, k, egvals, vecs)
+            v2 = getvelocity_formula(tm, 2, k, egvals, vecs)
+        end
+        nstates = length(egvals)
+        for n in 1:nstates
             ϵn = egvals[n]
             fn = fermidirac(T, ϵn - μ)
-            for m in 1:tm.norbits
+            for m in 1:nstates
                 ϵm = egvals[m]
                 Δ = ϵn - ϵm
+                if delta_window !== nothing && abs(Δ) > delta_window
+                    continue
+                end
                 velocity_products[1,1] = v1[n,m]*v1[m,n]
                 velocity_products[1,2] = v1[n,m]*v2[m,n]
                 velocity_products[2,1] = v2[n,m]*v1[m,n]
@@ -610,9 +752,32 @@ function _build_weighted_mesh(tm::AbstractTBModel, nkmesh::Vector{Int64}; use_sy
     end
 end
 
-function getAC(tm::AbstractTBModel, α::Int64, β::Int64, ωs::Vector{Float64}, nkmesh::Vector{Int64},
-    T::Float64, μ::Float64; gs::Int64=1, δ::Float64=0.05, use_symmetry::Bool=true,
-    symmetrize::Bool=use_symmetry, symmetrize_match_ibz::Bool=true, mesh_kwargs...)
+function getAC(
+    tm::AbstractTBModel,
+    α::Int64,
+    β::Int64,
+    ωs::Vector{Float64},
+    nkmesh::Vector{Int64},
+    T::Float64,
+    μ::Float64;
+    gs::Int64=1,
+    δ::Float64=0.05,
+    use_symmetry::Bool=true,
+    symmetrize::Bool=use_symmetry,
+    symmetrize_match_ibz::Bool=true,
+    use_sparse::Bool=false,
+    transition_delta_window::Union{Nothing,Float64}=nothing,
+    sparse_window::Union{Nothing,Float64}=nothing,
+    sparse_nev::Int=DEFAULT_SPARSE_OPTS.nev,
+    sparse_min_states::Int=DEFAULT_SPARSE_OPTS.min_states,
+    sparse_max_tries::Int=DEFAULT_SPARSE_OPTS.max_tries,
+    sparse_growth::Float64=DEFAULT_SPARSE_OPTS.growth_factor,
+    sparse_tol::Float64=DEFAULT_SPARSE_OPTS.tol,
+    sparse_maxiter::Int=DEFAULT_SPARSE_OPTS.maxiter,
+    sparse_dense_cutoff::Int=DEFAULT_SPARSE_OPTS.dense_cutoff,
+    sparse_fallback_full::Bool=DEFAULT_SPARSE_OPTS.fallback_full,
+    mesh_kwargs...
+)
     size(nkmesh, 1) == 3 || error("nkmesh should be a 3-element vector.")
     # 2D slab optimization: only in-plane components (xx, xy, yx, yy) are relevant.
     if nkmesh[3] == 1 && (α == 3 || β == 3)
@@ -643,10 +808,26 @@ function getAC(tm::AbstractTBModel, α::Int64, β::Int64, ωs::Vector{Float64}, 
         println(f, "Sum of weights: $(sum(weights))")
     end
     
+    sparse_opts = _normalize_sparse_opts(merge(
+        DEFAULT_SPARSE_OPTS,
+        (
+            use_sparse = use_sparse,
+            window = sparse_window,
+            nev = sparse_nev,
+            min_states = sparse_min_states,
+            max_tries = sparse_max_tries,
+            growth_factor = sparse_growth,
+            tol = sparse_tol,
+            maxiter = sparse_maxiter,
+            dense_cutoff = sparse_dense_cutoff,
+            fallback_full = sparse_fallback_full,
+        ),
+    ))
+
     chunks = _split_kmesh_with_weights(kpts, weights, nworkers())
 
     if nkmesh[3] == 1
-        pf = ParallelFunction(AC_tensor_worker_2d, tm, ωs, T, μ, δ)
+        pf = ParallelFunction(AC_tensor_worker_2d, tm, ωs, T, μ, δ, sparse_opts, transition_delta_window)
         println("nworkers: ", nworkers(), ", jobs: ", length(chunks))
         for chunk in chunks
             pf(chunk)
@@ -690,7 +871,7 @@ function getAC(tm::AbstractTBModel, α::Int64, β::Int64, ωs::Vector{Float64}, 
         σ2 .*= (-im * gs * bzvol / (2 * pi))
         return σ2[α, β, :]
     else
-        pf = ParallelFunction(AC_tensor_worker, tm, ωs, T, μ, δ)
+        pf = ParallelFunction(AC_tensor_worker, tm, ωs, T, μ, δ, sparse_opts, transition_delta_window)
         println("nworkers: ", nworkers(), ", jobs: ", length(chunks))
         for chunk in chunks
             pf(chunk)

@@ -1,7 +1,7 @@
 using LinearAlgebra
 using .Memoize
 
-export getH, getdH, getS, getdS, geteig, getdEs, getA, getdr, getvelocity, getspin, get_berry_curvature
+export getH, getdH, getS, getdS, geteig, getdEs, getA, getdr, getvelocity, getspin, get_berry_curvature,getvelocity_formula
 
 const DEGEN_THRESH = [1.0e-4]
 
@@ -176,6 +176,17 @@ Calculate eigenvalues and eigenvectors of `tm` at a reduced `k` point.
     else
         S = getS(tm, k)
         (Es, V) = eigen(Hermitian(H), Hermitian(S))
+    end
+    return HermEig(Es, V)
+end
+
+@memoize k function geteig(tm::SparseTBModel, k::AbstractVector{<:Real})::HermEig
+    H = Matrix(getH(tm, k))
+    if tm.isorthogonal
+        Es, V = eigen(Hermitian(H))
+    else
+        S = Matrix(getS(tm, k))
+        Es, V = eigen(Hermitian(H), Hermitian(S))
     end
     return HermEig(Es, V)
 end
@@ -408,6 +419,122 @@ v[n, m] is only correct when band m is nondegenerate or completely degenerate.
     for m in 1:tm.norbits, n in 1:tm.norbits
         if n != m
             v[n, m] = im*(Es[n]-Es[m])*Aα[n, m]
+        end
+    end
+    return v
+end
+
+
+function getvelocity(
+    tm::AbstractTBModel,
+    α::Int64,
+    k::AbstractVector{<:Real},
+    eigvals::AbstractVector{<:Real},
+    eigvecs::AbstractMatrix{<:Complex}
+)::Matrix{ComplexF64}
+    size(eigvecs, 1) == tm.norbits ||
+        throw(ArgumentError("eigvecs should have $(tm.norbits) rows."))
+    length(eigvals) == size(eigvecs, 2) ||
+        throw(ArgumentError("eigvals length must match number of eigenvectors."))
+
+    order = getorder(α)
+    dH = getdH(tm, order, k)
+    dS = getdS(tm, order, k)
+    Aw = getAw(tm, α, k)
+
+    V = Matrix{ComplexF64}(eigvecs)
+    Es = Float64.(eigvals)
+    nstates = length(Es)
+
+    dHbar = V' * dH * V
+    dSbar = V' * dS * V
+    Awbar = V' * Aw * V
+
+    D = zeros(ComplexF64, nstates, nstates)
+    for m in 1:nstates
+        Em = Es[m]
+        for n in 1:nstates
+            if n == m
+                continue
+            end
+            En = Es[n]
+            denom = Em - En
+            if abs(denom) > DEGEN_THRESH[1]
+                D[n, m] = (dHbar[n, m] - Em * dSbar[n, m]) / denom
+            else
+                D[n, m] = im * Awbar[n, m]
+            end
+        end
+    end
+
+    Aα = im .* D .+ Awbar
+    v = Matrix{ComplexF64}(undef, nstates, nstates)
+    for n in 1:nstates
+        diag_val = real(dHbar[n, n] - Es[n] * dSbar[n, n])
+        v[n, n] = ComplexF64(diag_val, 0.0)
+    end
+    for m in 1:nstates, n in 1:nstates
+        if n != m
+            v[n, m] = im * (Es[n] - Es[m]) * Aα[n, m]
+        end
+    end
+    return v
+end
+
+raw"""
+```julia
+getvelocity_formula(tm::AbstractTBModel, α::Int64, k::AbstractVector{<:Real},
+    eigvals::AbstractVector{<:Real}, eigvecs::AbstractMatrix{<:Complex})
+```
+
+Compute the velocity matrix via the closed-form expression
+```math
+⟨km|v̂_α|kn⟩ = \sum_{MN} C_{M}^{km*} C_{N}^{kn}
+\left(∂_{k_α} H_{MN}(k) - ε_{kn} ∂_{k_α} S_{MN}(k)\right)
++ i (ε_{km}-ε_{kn}) A_{MN}^{α}(k),
+```
+thus avoiding explicit divisions by energy differences. `eigvals` /
+`eigvecs` should match the supplied `k`-point.
+"""
+function getvelocity_formula(
+    tm::AbstractTBModel,
+    α::Int64,
+    k::AbstractVector{<:Real},
+    eigvals::AbstractVector{<:Real},
+    eigvecs::AbstractMatrix{<:Complex}
+)::Matrix{ComplexF64}
+    size(eigvecs, 1) == tm.norbits ||
+        throw(ArgumentError("eigvecs should have $(tm.norbits) rows."))
+    length(eigvals) == size(eigvecs, 2) ||
+        throw(ArgumentError("eigvals length must match number of eigenvectors."))
+
+    order = getorder(α)
+    dH = getdH(tm, order, k)
+    dS = getdS(tm, order, k)
+    Aw = getAw(tm, α, k)
+
+    V = Matrix{ComplexF64}(eigvecs)
+    Es = Float64.(eigvals)
+    nstates = length(Es)
+
+    dHbar = V' * dH * V
+    dSbar = V' * dS * V
+    Awbar = V' * Aw * V
+
+    v = Matrix{ComplexF64}(undef, nstates, nstates)
+    for n in 1:nstates
+        diag_val = real(dHbar[n, n] - Es[n] * dSbar[n, n])
+        v[n, n] = ComplexF64(diag_val, 0.0)
+    end
+    for m in 1:nstates, n in 1:nstates
+        if n == m
+            continue
+        end
+        Δ = Es[n] - Es[m]
+        if abs(Δ) <= DEGEN_THRESH[1]
+            v[n, m] = 0.0 + 0.0im
+        else
+            v[n, m] = dHbar[n, m] - Es[m] * dSbar[n, m] + im * Δ * Awbar[n, m]
         end
     end
     return v

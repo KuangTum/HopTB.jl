@@ -12,11 +12,15 @@ include("parallel.jl")
 
 # direct members
 include("model.jl")
+include("sparse_model.jl")
+using .SparseModel: SparseTBModel
 include("basic.jl")
+include("sparse_extensions.jl")
 include("fs.jl")
 
 
 # submodules
+include("sparse_calc.jl")
 include("optics.jl")
 include("bs.jl")
 include("hall.jl")
