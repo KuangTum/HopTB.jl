@@ -12,7 +12,8 @@ export PartialHermEig, eigs_near, eigs_window, pardiso_available
 
 const DEFAULT_DENSE_THRESHOLD = 64
 const DEFAULT_PARDISO_MIN_SIZE = 96
-const DEFAULT_SOLVER = :auto
+const DEFAULT_SOLVER = :pardiso
+const DEFAULT_ILL_THRESHOLD = 5e-4
 
 const _pardiso_supported = Ref(true)
 const _pardiso_available = Ref(false)
@@ -38,6 +39,18 @@ _pardiso_active() = _pardiso_supported[] && _pardiso_available[]
 
 function pardiso_available()
     return _pardiso_active()
+end
+
+function _ill_threshold()
+    val = get(ENV, "HOPTB_ILL_THRESHOLD", nothing)
+    if val === nothing || isempty(strip(val))
+        return DEFAULT_ILL_THRESHOLD
+    end
+    try
+        return parse(Float64, strip(val))
+    catch
+        return DEFAULT_ILL_THRESHOLD
+    end
 end
 
 struct PartialHermEig
@@ -93,6 +106,46 @@ function _dense_eigs(tm::AbstractTBModel, k::AbstractVector{<:Real},
         residuals = residuals[mask]
     end
     return PartialHermEig(energies, vectors, residuals, reference)
+end
+
+function _orthonormalize_eigenpairs(H::Matrix{ComplexF64},
+        S::Union{Nothing,Matrix{ComplexF64}},
+        energies::Vector{Float64},
+        vecs::Matrix{ComplexF64},
+        ill_threshold::Float64)
+
+    S === nothing && return energies, vecs
+    m = size(vecs, 2)
+    m == 0 && return energies, vecs
+
+    # Step 1: Euclidean QR to get subspace basis
+    Q = Matrix(qr(vecs).Q)                    # n×m, Q'Q = I
+
+    # Step 2: subspace matrices
+    Ssub = Hermitian(Q' * S * Q)
+    Hsub = Hermitian(Q' * H * Q)
+
+    # Step 3: eigen-decompose Ssub and drop ill-conditioned directions
+    evalS, vecS = eigen(Ssub)
+    keep = abs.(evalS) .> ill_threshold
+    if !all(keep)
+        @warn "ill-conditioned eigenvalues detected, projected out $(count(!, keep)) eigenvalues"
+    end
+    V = vecS[:, keep]
+    Λ = evalS[keep]
+    if length(Λ) == 0
+        return energies, vecs
+    end
+
+    # Step 4: reduced generalized problem
+    Qp = Q * V
+    Ssub_p = Matrix(Diagonal(real.(Λ)))
+    Hsub_p = Hermitian(Qp' * H * Qp)
+    eval_new, Z = eigen(Hsub_p, Hermitian(Ssub_p))
+
+    # Step 5: map back
+    X = Qp * Z
+    return Float64.(eval_new), X
 end
 
 function _compute_residuals(H::AbstractMatrix{<:Complex}, S::Union{Nothing,AbstractMatrix{<:Complex}},
@@ -280,6 +333,8 @@ end
     end
     energies = Float64.(real(vals[1:nconv]))
     vecs = vecs[:, 1:nconv]
+    ill_threshold = _ill_threshold()
+    energies, vecs = _orthonormalize_eigenpairs(Hmat, Smat, energies, vecs, ill_threshold)
     order = sortperm(abs.(energies .- ref))
     energies = energies[order]
     vecs = vecs[:, order]
@@ -321,4 +376,17 @@ function eigs_window(tm::AbstractTBModel, k::AbstractVector{<:Real}, reference::
     return last_spec
 end
 
+end
+const DEFAULT_ILL_THRESHOLD = 5e-4
+
+_ill_threshold() = begin
+    val = get(ENV, "HOPTB_ILL_THRESHOLD", nothing)
+    if val === nothing || isempty(strip(val))
+        return DEFAULT_ILL_THRESHOLD
+    end
+    try
+        return parse(Float64, strip(val))
+    catch
+        return DEFAULT_ILL_THRESHOLD
+    end
 end
