@@ -526,9 +526,9 @@ function getvelocity_formula(
     # Without these parens, Julia evaluates left-to-right `(V' * M) * V`, falling
     # back to dense * sparse (treats sparse as dense) which is O(n^2 * nev) — ~3000×
     # slower for n=110k, nev=50.
-    dHbar = V' * (dH * V)
-    dSbar = V' * (dS * V)
-    Awbar = V' * (Aw * V)
+    dHbar = V' * _sparse_times_dense(dH, V)
+    dSbar = V' * _sparse_times_dense(dS, V)
+    Awbar = V' * _sparse_times_dense(Aw, V)
 
     v = Matrix{ComplexF64}(undef, nstates, nstates)
     for n in 1:nstates

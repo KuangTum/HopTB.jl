@@ -2,6 +2,8 @@ module HopTB
 
 # memoization module
 include("memoize.jl")
+# threaded sparse kernels
+include("threaded_sparse.jl")
 # mesh module
 include("mesh.jl")
 # utilities module
