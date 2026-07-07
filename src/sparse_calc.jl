@@ -267,10 +267,23 @@ struct PardisoShiftOp
     solver
     matrix
     rhs_buffer::Vector{ComplexF64}
-    S::Union{Nothing,Matrix{ComplexF64}}
+    S::Union{Nothing,AbstractMatrix{ComplexF64}}
     dummy::Vector{ComplexF64}
     n::Int
 end
+
+# Wall-time split of the shift-invert matvec (S-multiply vs Pardiso solve),
+# accumulated across all mul! calls in this process. Read/reset from drivers.
+const MATVEC_STATS = Dict{Symbol,Float64}(:n => 0.0, :smul => 0.0, :solve => 0.0)
+
+function reset_matvec_stats!()
+    for key in keys(MATVEC_STATS)
+        MATVEC_STATS[key] = 0.0
+    end
+    return nothing
+end
+
+matvec_stats() = copy(MATVEC_STATS)
 
 _pardiso_cleanup!(op::PardisoShiftOp) = begin
     Pardiso.set_phase!(op.solver, Pardiso.RELEASE_ALL)
@@ -292,13 +305,19 @@ end
 Base.eltype(::Type{PardisoShiftOp}) = ComplexF64
 
 function LinearAlgebra.mul!(y::AbstractVector{ComplexF64}, op::PardisoShiftOp, x::AbstractVector{ComplexF64})
+    t0 = time_ns()
     if op.S === nothing
         copyto!(op.rhs_buffer, x)
     else
         mul!(op.rhs_buffer, op.S, x)
     end
+    t1 = time_ns()
     Pardiso.set_phase!(op.solver, Pardiso.SOLVE_ITERATIVE_REFINE)
     Pardiso.pardiso(op.solver, y, op.matrix, op.rhs_buffer)
+    t2 = time_ns()
+    MATVEC_STATS[:n] += 1
+    MATVEC_STATS[:smul] += (t1 - t0) / 1e9
+    MATVEC_STATS[:solve] += (t2 - t1) / 1e9
     return y
 end
 
@@ -339,7 +358,13 @@ function _build_pardiso_linear_operator(H::AbstractMatrix{ComplexF64},
     Pardiso.set_phase!(solver, Pardiso.NUM_FACT)
     Pardiso.pardiso(solver, Ap, dummy)
     rhs_buffer = zeros(ComplexF64, n)
-    return PardisoShiftOp(solver, Ap, rhs_buffer, S, dummy, n)
+    # Store S as passed — sparse stays sparse. (The field was previously typed
+    # Union{Nothing,Matrix{ComplexF64}}, which silently densified a sparse S:
+    # a 193 GB allocation at 110k orbits, re-streamed by every ARPACK matvec.)
+    # HOPTB_FORCE_DENSE_S=true restores the old behavior for A/B benchmarks.
+    S_store = (S !== nothing && get(ENV, "HOPTB_FORCE_DENSE_S", "") == "true") ?
+        Matrix{ComplexF64}(S) : S
+    return PardisoShiftOp(solver, Ap, rhs_buffer, S_store, dummy, n)
 end
 
 function _arpack_eigs_pardiso(H::AbstractMatrix{ComplexF64},
