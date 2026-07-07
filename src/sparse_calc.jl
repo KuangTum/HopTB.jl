@@ -3,12 +3,91 @@ module SparseCalc
 using LinearAlgebra
 using SparseArrays
 using Arpack
+using HDF5
 
 using ..HopTB
 using ..HopTB: AbstractTBModel
 using ..HopTB.Memoize: @memoize
 
 export PartialHermEig, eigs_near, eigs_window, pardiso_available
+
+# ----- HDF5 eigenpair cache (full-diag only) -------------------------------
+# Set ENV["HOPTB_EIGCACHE_DIR"] to a directory before the first eigs_near
+# call. When this is set and `_dense_eigs` is invoked, the (energies, vectors)
+# from a full diagonalization are stashed to/loaded from
+#   <dir>/eig_n<N>_k<k1>_<k2>_<k3>_r<ref>_w<win>.h5
+# so a subsequent run at the same (k, reference, window) reads instead of
+# diagonalizing. Use a snapshot-specific dir to avoid cross-model collisions.
+function _eigcache_dir()
+    val = get(ENV, "HOPTB_EIGCACHE_DIR", "")
+    return isempty(strip(val)) ? nothing : strip(val)
+end
+
+function _eigcache_filename(dir::AbstractString, n_orb::Integer,
+        k::AbstractVector{<:Real}, ref::Float64, window::Union{Nothing,Real})
+    win = window === nothing ? Inf : Float64(window)
+    _f(x) = string(round(Float64(x); digits=6))
+    fname = string("eig_n", Int(n_orb),
+                   "_k", _f(k[1]), "_", _f(k[2]), "_", _f(k[3]),
+                   "_r", _f(ref),
+                   "_w", isfinite(win) ? _f(win) : "inf",
+                   ".h5")
+    return joinpath(dir, fname)
+end
+
+function _eigcache_fingerprint(tm::AbstractTBModel)::Float64
+    # Cheap "is this still the same model?" check. Sums the lattice-vector
+    # diagonal — robust enough that a different snapshot (geometry change)
+    # produces a different fingerprint, while the same model rebuilt
+    # deterministically reproduces it.
+    L = tm.lat
+    return Float64(L[1,1] + L[2,2] + L[3,3])
+end
+
+function _eigcache_load(path::AbstractString, tm::AbstractTBModel,
+        k::AbstractVector{<:Real}, ref::Float64,
+        window::Union{Nothing,Real})
+    isfile(path) || return nothing
+    try
+        h5open(path, "r") do f
+            n_orb = read(f, "n_orbits")
+            n_orb == tm.norbits || return nothing
+            fp = read(f, "lat_fingerprint")
+            isapprox(fp, _eigcache_fingerprint(tm); atol=1e-9, rtol=1e-9) || return nothing
+            energies = read(f, "energies")::Vector{Float64}
+            vectors  = read(f, "vectors")::Matrix{ComplexF64}
+            residuals = haskey(f, "residuals") ? read(f, "residuals")::Vector{Float64} :
+                zeros(Float64, length(energies))
+            return PartialHermEig(energies, vectors, residuals, ref)
+        end
+    catch err
+        @warn "Eigcache read failed; falling back to diagonalization." path exception=err
+        return nothing
+    end
+end
+
+function _eigcache_save(path::AbstractString, tm::AbstractTBModel,
+        k::AbstractVector{<:Real}, ref::Float64, window::Union{Nothing,Real},
+        spec)
+    try
+        mkpath(dirname(path))
+        win = window === nothing ? Inf : Float64(window)
+        h5open(path, "w") do f
+            write(f, "version",   1)
+            write(f, "n_orbits",  Int(tm.norbits))
+            write(f, "lat_fingerprint", _eigcache_fingerprint(tm))
+            write(f, "reference", ref)
+            write(f, "window",    win)
+            write(f, "k",         Float64.(collect(k)))
+            write(f, "energies",  spec.values)
+            write(f, "vectors",   spec.vectors)
+            write(f, "residuals", spec.residuals)
+        end
+    catch err
+        @warn "Eigcache write failed." path exception=err
+    end
+    return nothing
+end
 
 const DEFAULT_DENSE_THRESHOLD = 64
 const DEFAULT_PARDISO_MIN_SIZE = 96
@@ -92,6 +171,15 @@ end
 
 function _dense_eigs(tm::AbstractTBModel, k::AbstractVector{<:Real},
     reference::Float64, window::Union{Nothing,Real})::PartialHermEig
+    cache_dir = _eigcache_dir()
+    cache_path = cache_dir === nothing ? nothing :
+        _eigcache_filename(cache_dir, tm.norbits, k, reference, window)
+    if cache_path !== nothing
+        cached = _eigcache_load(cache_path, tm, k, reference, window)
+        if cached !== nothing
+            return cached
+        end
+    end
     spec = HopTB.geteig(tm, k)
     energies = Float64.(spec.values)
     order = sortperm(abs.(energies .- reference))
@@ -105,11 +193,15 @@ function _dense_eigs(tm::AbstractTBModel, k::AbstractVector{<:Real},
         vectors = vectors[:, mask]
         residuals = residuals[mask]
     end
-    return PartialHermEig(energies, vectors, residuals, reference)
+    result = PartialHermEig(energies, vectors, residuals, reference)
+    if cache_path !== nothing
+        _eigcache_save(cache_path, tm, k, reference, window, result)
+    end
+    return result
 end
 
-function _orthonormalize_eigenpairs(H::Matrix{ComplexF64},
-        S::Union{Nothing,Matrix{ComplexF64}},
+function _orthonormalize_eigenpairs(H::AbstractMatrix{ComplexF64},
+        S::Union{Nothing,AbstractMatrix{ComplexF64}},
         energies::Vector{Float64},
         vecs::Matrix{ComplexF64},
         ill_threshold::Float64)
@@ -121,9 +213,13 @@ function _orthonormalize_eigenpairs(H::Matrix{ComplexF64},
     # Step 1: Euclidean QR to get subspace basis
     Q = Matrix(qr(vecs).Q)                    # n×m, Q'Q = I
 
-    # Step 2: subspace matrices
-    Ssub = Hermitian(Q' * S * Q)
-    Hsub = Hermitian(Q' * H * Q)
+    # Step 2: subspace matrices.
+    # H, S may be sparse (the SparseTBModel path) — Q' * sparse * Q produces
+    # a small dense m×m matrix without ever materializing dense H/S.
+    # Same parenthesization trick as in getvelocity_formula: `Q' * (M * Q)` runs
+    # SparseMatrixCSC * Matrix first (optimized), avoiding the slow dense*sparse path.
+    Ssub = Hermitian(Q' * (S * Q))
+    Hsub = Hermitian(Q' * (H * Q))
 
     # Step 3: eigen-decompose Ssub and drop ill-conditioned directions
     evalS, vecS = eigen(Ssub)
@@ -140,7 +236,7 @@ function _orthonormalize_eigenpairs(H::Matrix{ComplexF64},
     # Step 4: reduced generalized problem
     Qp = Q * V
     Ssub_p = Matrix(Diagonal(real.(Λ)))
-    Hsub_p = Hermitian(Qp' * H * Qp)
+    Hsub_p = Hermitian(Qp' * (H * Qp))
     eval_new, Z = eigen(Hsub_p, Hermitian(Ssub_p))
 
     # Step 5: map back
@@ -246,8 +342,8 @@ function _build_pardiso_linear_operator(H::AbstractMatrix{ComplexF64},
     return PardisoShiftOp(solver, Ap, rhs_buffer, S, dummy, n)
 end
 
-function _arpack_eigs_pardiso(H::Matrix{ComplexF64},
-    S::Union{Nothing,Matrix{ComplexF64}}, nev::Int,
+function _arpack_eigs_pardiso(H::AbstractMatrix{ComplexF64},
+    S::Union{Nothing,AbstractMatrix{ComplexF64}}, nev::Int,
     sigma::Float64, ncv::Int, tol::Float64, maxiter::Int)
     op = _build_pardiso_linear_operator(H, S, sigma)
     try
@@ -278,7 +374,7 @@ function _arpack_eigs_native(H::Hermitian{ComplexF64,Matrix{ComplexF64}},
     end
 end
 
-function _arpack_eigs(H::Matrix{ComplexF64}, S::Union{Nothing,Matrix{ComplexF64}},
+function _arpack_eigs(H::AbstractMatrix{ComplexF64}, S::Union{Nothing,AbstractMatrix{ComplexF64}},
     nev::Int, sigma::Float64, ncv::Union{Nothing,Int}, tol::Float64, maxiter::Int,
     solver::Symbol, pardiso_min_size::Int, fallback_full::Bool)
     size(H, 1) == size(H, 2) || error("H must be square.")
@@ -299,9 +395,10 @@ function _arpack_eigs(H::Matrix{ComplexF64}, S::Union{Nothing,Matrix{ComplexF64}
             solver_choice = :native
         end
     end
+    # native ARPACK path needs DENSE Hermitian; this is a memory cliff for large sparse models.
     ncv_native = ncv === nothing ? nothing : min(size(H, 1), Int(ncv))
-    Hherm = Hermitian(H)
-    Sherm = S === nothing ? nothing : Hermitian(S)
+    Hherm = Hermitian(Matrix(H))
+    Sherm = S === nothing ? nothing : Hermitian(Matrix(S))
     return _arpack_eigs_native(Hherm, Sherm, nev, sigma, ncv_native, tol, maxiter)
 end
 
@@ -319,8 +416,11 @@ end
     if fallback_full && (n <= densethresh || neff >= n)
         return _dense_eigs(tm, k, ref, window)
     end
-    Hmat = HopTB.getH(tm, k)
-    Smat = tm.isorthogonal ? nothing : HopTB.getS(tm, k)
+    # Bypass `getH`/`getS` (which force dense conversion) and call the order-(0,0,0)
+    # Bloch sums directly. For SparseTBModel these return SparseMatrixCSC, avoiding
+    # an O(n²) dense allocation that would blow memory at >50k orbits.
+    Hmat = HopTB.getdH(tm, (0, 0, 0), k)
+    Smat = tm.isorthogonal ? nothing : HopTB.getdS(tm, (0, 0, 0), k)
     sigma_val = sigma === nothing ? ref : Float64(sigma)
     vals, vecs, nconv, niter, nmult, resid = _arpack_eigs(Hmat, Smat, neff, sigma_val,
         ncv, Float64(tol), Int(maxiter), solver, Int(pardiso_min_size), fallback_full)

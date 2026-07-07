@@ -4,6 +4,7 @@ version = "0.8.2"
 
 [deps]
 Arpack = "7d9fca2a-8960-54d3-9f78-7d1dccf2cb97"
+ClusterManagers = "34f1f09b-3a8b-5176-ab39-66d58a4d544e"
 Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 Downloads = "f43a241f-c20a-4ad4-852c-f6b1247861c6"
 HCubature = "19dc6840-f33b-545b-b366-655c7e3ffd49"

@@ -511,15 +511,24 @@ function getvelocity_formula(
     order = getorder(α)
     dH = getdH(tm, order, k)
     dS = getdS(tm, order, k)
-    Aw = getAw(tm, α, k)
+    # NOTE: `getAw(tm, α, k)` has return-type annotation `::Matrix{ComplexF64}`
+    # which forces conversion to dense — at 110k orbits that's a 193 GB alloc and
+    # the dominant cost of `getvelocity_formula`. Call `getdAw(tm, α, (0,0,0), k)`
+    # directly so SparseTBModel returns sparse.
+    Aw = getdAw(tm, α, (0, 0, 0), k)
 
     V = Matrix{ComplexF64}(eigvecs)
     Es = Float64.(eigvals)
     nstates = length(Es)
 
-    dHbar = V' * dH * V
-    dSbar = V' * dS * V
-    Awbar = V' * Aw * V
+    # IMPORTANT: parenthesize as `V' * (M * V)` so the sparse-times-dense `M * V`
+    # runs first (Julia has an optimized SparseMatrixCSC * Matrix path, ~O(nnz*nev)).
+    # Without these parens, Julia evaluates left-to-right `(V' * M) * V`, falling
+    # back to dense * sparse (treats sparse as dense) which is O(n^2 * nev) — ~3000×
+    # slower for n=110k, nev=50.
+    dHbar = V' * (dH * V)
+    dSbar = V' * (dS * V)
+    Awbar = V' * (Aw * V)
 
     v = Matrix{ComplexF64}(undef, nstates, nstates)
     for n in 1:nstates

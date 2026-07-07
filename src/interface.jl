@@ -1,7 +1,10 @@
 module Interface
 
 using StaticArrays, LinearAlgebra
+using SparseArrays
+using Serialization
 using ..HopTB
+using ..HopTB.SparseModel: SparseTBModel, RVector, R0
 using HDF5
 using JSON
 using Printf
@@ -586,24 +589,7 @@ function createmodelopenmx38(filepath::String)
 end
 
 
-"""
-    createmodeldeephopenmx(dir::String)
-
-Construct a tight-binding model from a DeepH OpenMX-style directory.
-
-The directory `dir` is expected to contain:
-
-  * `lat.dat` – three lines with lattice vectors in Bohr units.
-  * `orbital_types.dat` – one line per atom listing orbital types.
-  * `site_positions.dat` – three lines giving atomic positions (Bohr).
-  * `hamiltonians_pred.h5` – datasets named `i/j/k/atom_i/atom_j` with
-    Hamiltonian blocks in Hartree.
-  * `openmx_olpr.scfout` – overlap and position matrices as produced by
-    OpenMX's `OLP` output.
-
-All lengths are converted from Bohr to Å and energies from Hartree to eV.
-"""
-function createmodeldeephopenmx(dir::String; sparse::Bool=false)
+function _build_deeph_legacy(dir::String; sparse::Bool=false)
     bohr_to_ang = 0.529177249
     hartree_to_ev = 27.211399
     verbose = get(ENV, "HOPTB_VERBOSE", "false") == "true"
@@ -802,6 +788,362 @@ function createmodeldeephopenmx(dir::String; sparse::Bool=false)
     nm.nsites = atomnum
     nm.site_norbits = Vector{Int16}(Total_NumOrbs)
     nm.site_positions = atom_pos
+    return nm
+end
+
+
+# ===== Tier B: COO-triplet sparse builder for DeePH/OpenMX =====
+# Mirrors DeepH's `inference/sparse_calc.jl` strategy: bulk HDF5 read +
+# COO-triplet accumulation per R + one `sparse(I, J, V, n, n)` per block.
+# Drops construction cost from O(nnz²) to O(nnz log nnz).
+
+"""
+    _create_dict_h5(filename) -> Dict{NTuple{5,Int},Matrix}
+
+Read every dataset of a DeepH-format HDF5 (flat structure, keys like
+"[Rx, Ry, Rz, atom_i, atom_j]") into a Julia Dict, parsing the key once.
+"""
+function _create_dict_h5(filename::String)
+    fid = HDF5.h5open(filename, "r")
+    ks = collect(keys(fid))
+    isempty(ks) && (close(fid); return Dict{NTuple{5,Int},Matrix{ComplexF64}}())
+    T = eltype(fid[ks[1]])
+    out = Dict{NTuple{5,Int}, Matrix{T}}()
+    for k in ks
+        idx = JSON.parse(k)
+        key = (Int(idx[1]), Int(idx[2]), Int(idx[3]), Int(idx[4]), Int(idx[5]))
+        out[key] = read(fid[k])
+    end
+    close(fid)
+    return out
+end
+
+@inline function _ensure_vec!(d::Dict, R, ::Type{T}) where T
+    haskey(d, R) || (d[R] = T[])
+    return d[R]
+end
+
+"""
+    _build_deeph_fast(dir; sparse=true)
+
+COO-triplet builder. Same inputs as `_build_deeph_legacy`, identical numerics
+on the resulting `SparseTBModel` / `TBModel`, but ~20× faster on first build
+because it bypasses per-element `sethopping!`/`setoverlap!`/`setposition!`.
+"""
+function _build_deeph_fast(dir::String; sparse::Bool=true)
+    bohr_to_ang = 0.529177249
+    verbose = get(ENV, "HOPTB_VERBOSE", "false") == "true"
+
+    # ---- geometry ----
+    lat = zeros(Float64, 3, 3)
+    open(joinpath(dir, "lat.dat")) do io
+        for i in 1:3
+            lat[i, :] = parse.(Float64, split(readline(io)))
+        end
+    end
+    pos_lines = readlines(joinpath(dir, "site_positions.dat"))
+    natoms_pos = length(split(pos_lines[1]))
+    atom_pos = zeros(Float64, 3, natoms_pos)
+    for α in 1:3
+        atom_pos[α, :] = parse.(Float64, split(pos_lines[α]))
+    end
+
+    # ---- overlap-only OpenMX scfout (binary) ----
+    # Re-use the legacy reader by calling it once via the legacy function path
+    # would be wasteful; replicate the lightweight binary read here.
+    olpr = _read_olpr_for_fast(joinpath(dir, "openmx_olpr.scfout"))
+    atomnum = olpr.atomnum
+    TNO     = olpr.TNO
+    FNAN    = olpr.FNAN
+    natn    = olpr.natn
+    ncn     = olpr.ncn
+    atv_ijk = olpr.atv_ijk
+    OLP     = olpr.OLP
+    OLP_r   = olpr.OLP_r
+
+    # Bohr → Å for r, then add atom_pos[α, atom_i] * OLP[i][j] (matches legacy).
+    # NOTE: `_read_olpr_for_fast` already applied `FNAN .+= 1`, so FNAN[i] is
+    # already the (FNAN_C[i] + 1) "self-included" count and is the right loop bound.
+    for α in 1:3, i in 1:atomnum, h in 1:FNAN[i]
+        OLP_r[α][i][h] .*= bohr_to_ang
+    end
+    for α in 1:3, i in 1:atomnum, h in 1:FNAN[i]
+        OLP_r[α][i][h] .+= atom_pos[α, i] .* OLP[i][h]
+    end
+
+    Total_NumOrbs = TNO
+    numorb_base = cumsum([0; Total_NumOrbs[1:end-1]])
+    norbits = sum(Total_NumOrbs)
+    verbose && println("[fast] norbits = $norbits")
+
+    # Note: legacy uses FNAN+1 entries (the +1 is the self-block). We mirror that.
+    fnan_iter = FNAN  # legacy did `FNAN .+= 1` inside _read_olpr; here we did the same in our reader
+
+    if !sparse
+        # Tier B is only specialized for sparse builds; fall through to legacy for dense.
+        return _build_deeph_legacy(dir; sparse=false)
+    end
+
+    # ---- COO accumulators ----
+    I_H = Dict{RVector, Vector{Int64}}()
+    J_H = Dict{RVector, Vector{Int64}}()
+    V_H = Dict{RVector, Vector{ComplexF64}}()
+    I_S = Dict{RVector, Vector{Int64}}()
+    J_S = Dict{RVector, Vector{Int64}}()
+    V_S = Dict{RVector, Vector{ComplexF64}}()
+    I_r = ntuple(_ -> Dict{RVector, Vector{Int64}}(), 3)
+    J_r = ntuple(_ -> Dict{RVector, Vector{Int64}}(), 3)
+    V_r = ntuple(_ -> Dict{RVector, Vector{ComplexF64}}(), 3)
+
+    # ---- S and r from scfout (legacy-mimic: 2 pushes per scalar) ----
+    # Each setoverlap!(R, i, j, val_S) writes both +R[i,j] and -R[j,i].
+    # Each setposition!(R, i, j, α, val_r) writes both +R[i,j] and -R[j,i] with shift.
+    # We push all 4 (+R, -R) entries per scalar, and use combine=last-wins in
+    # sparse() so iter-B's writes naturally overwrite iter-A's at shared indices.
+    t0 = time()
+    for atom_i in 1:atomnum, h in 1:fnan_iter[atom_i]
+        atom_j = natn[atom_i][h]
+        Rraw = atv_ijk[:, ncn[atom_i][h]]
+        R = RVector(Int16(Rraw[1]), Int16(Rraw[2]), Int16(Rraw[3]))
+        negR = -R
+        blockS = OLP[atom_i][h]
+        blockRx = OLP_r[1][atom_i][h]
+        blockRy = OLP_r[2][atom_i][h]
+        blockRz = OLP_r[3][atom_i][h]
+        shift_vec = lat * Float64.(Rraw)              # (lat·R)[α]
+        for ii in 1:TNO[atom_i], jj in 1:TNO[atom_j]
+            i_orb = numorb_base[atom_i] + ii
+            j_orb = numorb_base[atom_j] + jj
+            valS = ComplexF64(blockS[jj, ii])
+            valRx = ComplexF64(blockRx[jj, ii])
+            valRy = ComplexF64(blockRy[jj, ii])
+            valRz = ComplexF64(blockRz[jj, ii])
+            on_diag = (R == R0 && i_orb == j_orb)
+            if on_diag
+                # Self-block diagonal: real-only, no -R push (legacy sethopping! semantics).
+                valS = ComplexF64(real(valS), 0.0)
+                valRx = ComplexF64(real(valRx), 0.0)
+                valRy = ComplexF64(real(valRy), 0.0)
+                valRz = ComplexF64(real(valRz), 0.0)
+                push!(_ensure_vec!(I_S, R, Int64), i_orb); push!(_ensure_vec!(J_S, R, Int64), j_orb); push!(_ensure_vec!(V_S, R, ComplexF64), valS)
+                push!(_ensure_vec!(I_r[1], R, Int64), i_orb); push!(_ensure_vec!(J_r[1], R, Int64), j_orb); push!(_ensure_vec!(V_r[1], R, ComplexF64), valRx)
+                push!(_ensure_vec!(I_r[2], R, Int64), i_orb); push!(_ensure_vec!(J_r[2], R, Int64), j_orb); push!(_ensure_vec!(V_r[2], R, ComplexF64), valRy)
+                push!(_ensure_vec!(I_r[3], R, Int64), i_orb); push!(_ensure_vec!(J_r[3], R, Int64), j_orb); push!(_ensure_vec!(V_r[3], R, ComplexF64), valRz)
+            else
+                # +R writes (analog of step 1 in setoverlap!/setposition!).
+                push!(_ensure_vec!(I_S, R, Int64), i_orb); push!(_ensure_vec!(J_S, R, Int64), j_orb); push!(_ensure_vec!(V_S, R, ComplexF64), valS)
+                push!(_ensure_vec!(I_r[1], R, Int64), i_orb); push!(_ensure_vec!(J_r[1], R, Int64), j_orb); push!(_ensure_vec!(V_r[1], R, ComplexF64), valRx)
+                push!(_ensure_vec!(I_r[2], R, Int64), i_orb); push!(_ensure_vec!(J_r[2], R, Int64), j_orb); push!(_ensure_vec!(V_r[2], R, ComplexF64), valRy)
+                push!(_ensure_vec!(I_r[3], R, Int64), i_orb); push!(_ensure_vec!(J_r[3], R, Int64), j_orb); push!(_ensure_vec!(V_r[3], R, ComplexF64), valRz)
+                # -R writes (analog of step 2). For S: conj(val_S). For r: conj(val) - shift × conj(val_S).
+                neg_S_at_ji = conj(valS)
+                push!(_ensure_vec!(I_S, negR, Int64), j_orb); push!(_ensure_vec!(J_S, negR, Int64), i_orb); push!(_ensure_vec!(V_S, negR, ComplexF64), neg_S_at_ji)
+                push!(_ensure_vec!(I_r[1], negR, Int64), j_orb); push!(_ensure_vec!(J_r[1], negR, Int64), i_orb); push!(_ensure_vec!(V_r[1], negR, ComplexF64), conj(valRx) - shift_vec[1] * neg_S_at_ji)
+                push!(_ensure_vec!(I_r[2], negR, Int64), j_orb); push!(_ensure_vec!(J_r[2], negR, Int64), i_orb); push!(_ensure_vec!(V_r[2], negR, ComplexF64), conj(valRy) - shift_vec[2] * neg_S_at_ji)
+                push!(_ensure_vec!(I_r[3], negR, Int64), j_orb); push!(_ensure_vec!(J_r[3], negR, Int64), i_orb); push!(_ensure_vec!(V_r[3], negR, ComplexF64), conj(valRz) - shift_vec[3] * neg_S_at_ji)
+            end
+        end
+    end
+    verbose && println(@sprintf("[fast] S+r COO push    = %.2f s", time() - t0))
+
+    # ---- H from hamiltonians_pred.h5 (per-block COO push, in HDF5 native order) ----
+    # Legacy walks HDF5 via `_walk(f, [])` in `keys(g)` order. We iterate the same
+    # way so that combine=last-wins picks the same value at each shared (R, i, j)
+    # entry when the predicted H violates Hermiticity.
+    t0 = time()
+    HDF5.h5open(joinpath(dir, "hamiltonians_pred.h5"), "r") do f
+        function _walk_fast(g)
+            for name in keys(g)
+                obj = g[name]
+                if obj isa HDF5.Group
+                    _walk_fast(obj)
+                elseif obj isa HDF5.Dataset
+                    idx = JSON.parse(name)
+                    atom_i = Int(idx[4]); atom_j = Int(idx[5])
+                    R = RVector(Int16(idx[1]), Int16(idx[2]), Int16(idx[3]))
+                    negR = -R
+                    mat = read(obj)
+                    size(mat, 2) == TNO[atom_i] && size(mat, 1) == TNO[atom_j] ||
+                        error("H block size mismatch for key $name: got $(size(mat)) expected ($(TNO[atom_j]), $(TNO[atom_i]))")
+                    for ii in 1:TNO[atom_i], jj in 1:TNO[atom_j]
+                        i_orb = numorb_base[atom_i] + ii
+                        j_orb = numorb_base[atom_j] + jj
+                        val = ComplexF64(mat[jj, ii])
+                        if R == R0 && i_orb == j_orb
+                            val = ComplexF64(real(val), 0.0)
+                            push!(_ensure_vec!(I_H, R, Int64), i_orb); push!(_ensure_vec!(J_H, R, Int64), j_orb); push!(_ensure_vec!(V_H, R, ComplexF64), val)
+                        else
+                            push!(_ensure_vec!(I_H, R, Int64), i_orb); push!(_ensure_vec!(J_H, R, Int64), j_orb); push!(_ensure_vec!(V_H, R, ComplexF64), val)
+                            push!(_ensure_vec!(I_H, negR, Int64), j_orb); push!(_ensure_vec!(J_H, negR, Int64), i_orb); push!(_ensure_vec!(V_H, negR, ComplexF64), conj(val))
+                        end
+                    end
+                end
+            end
+        end
+        _walk_fast(f)
+    end
+    verbose && println(@sprintf("[fast] H COO push      = %.2f s", time() - t0))
+
+    # ---- materialize sparse blocks (combine = last-wins, mirrors CSC setindex!) ----
+    t0 = time()
+    lastwins = (x, y) -> y
+    # NB: qualify SparseArrays.sparse — the local kwarg `sparse::Bool` would otherwise shadow it.
+    H_blocks = Dict{RVector, SparseMatrixCSC{ComplexF64,Int64}}()
+    for R in keys(I_H)
+        H_blocks[R] = SparseArrays.sparse(I_H[R], J_H[R], V_H[R], norbits, norbits, lastwins)
+    end
+    S_blocks = Dict{RVector, SparseMatrixCSC{ComplexF64,Int64}}()
+    for R in keys(I_S)
+        S_blocks[R] = SparseArrays.sparse(I_S[R], J_S[R], V_S[R], norbits, norbits, lastwins)
+    end
+    pos_blocks = Dict{RVector, SVector{3,SparseMatrixCSC{ComplexF64,Int64}}}()
+    all_R_pos = union(keys(I_r[1]), keys(I_r[2]), keys(I_r[3]))
+    for R in all_R_pos
+        I1 = get(I_r[1], R, Int64[]); J1 = get(J_r[1], R, Int64[]); V1 = get(V_r[1], R, ComplexF64[])
+        I2 = get(I_r[2], R, Int64[]); J2 = get(J_r[2], R, Int64[]); V2 = get(V_r[2], R, ComplexF64[])
+        I3 = get(I_r[3], R, Int64[]); J3 = get(J_r[3], R, Int64[]); V3 = get(V_r[3], R, ComplexF64[])
+        pos_blocks[R] = SVector{3,SparseMatrixCSC{ComplexF64,Int64}}(
+            SparseArrays.sparse(I1, J1, V1, norbits, norbits, lastwins),
+            SparseArrays.sparse(I2, J2, V2, norbits, norbits, lastwins),
+            SparseArrays.sparse(I3, J3, V3, norbits, norbits, lastwins))
+    end
+    verbose && println(@sprintf("[fast] sparse() build  = %.2f s", time() - t0))
+
+    # ---- assemble SparseTBModel ----
+    nm = SparseTBModel{ComplexF64}(norbits, lat; isorthogonal=false)
+    nm.hoppings = H_blocks
+    nm.overlaps = S_blocks
+    nm.positions = pos_blocks
+    nm.nsites = atomnum
+    nm.site_norbits = Vector{Int16}(Total_NumOrbs)
+    nm.site_positions = atom_pos
+    return nm
+end
+
+# Local copy of `_read_olpr` (the legacy one is nested inside `_build_deeph_legacy`'s scope)
+function _read_olpr_for_fast(filepath::String)
+    function _read_packed_f64(io, num)
+        buf = Vector{Float64}(undef, 4*num); read!(io, buf)
+        M = reshape(buf, 4, num)
+        Matrix(M[2:4, :])
+    end
+    function _read_packed_i32(io, num)
+        buf = Vector{Int32}(undef, 4*num); read!(io, buf)
+        M = reshape(buf, 4, num)
+        Int.(M[2:4, :])
+    end
+    function _read_block_f64(io, rows::Int, cols::Int)
+        M = Matrix{Float64}(undef, rows, cols); read!(io, M); M
+    end
+    open(filepath, "r") do io
+        hdr = Vector{Int32}(undef, 7); read!(io, hdr)
+        atomnum      = Int(hdr[1])
+        spinP_switch = Int(hdr[2]) & 0x03
+        Catomnum     = Int(hdr[3]); Latomnum = Int(hdr[4]); Ratomnum = Int(hdr[5])
+        TCpyCell     = Int(hdr[6])
+        order_max    = Int(hdr[7])
+        atv     = _read_packed_f64(io, TCpyCell+1)
+        atv_ijk = _read_packed_i32(io, TCpyCell+1)
+        TNO  = Int.(read!(io, Vector{Int32}(undef, atomnum)))
+        FNAN = Int.(read!(io, Vector{Int32}(undef, atomnum)))
+        natn = [Int.(read!(io, Vector{Int32}(undef, FNAN[i]+1))) for i in 1:atomnum]
+        ncn  = [Int.(read!(io, Vector{Int32}(undef, FNAN[i]+1))) for i in 1:atomnum]
+        ncn  = ((x)->x .+ 1).(ncn)
+        tv  = _read_packed_f64(io, 3)
+        rtv = _read_packed_f64(io, 3)
+        gbuf = Vector{Float64}(undef, 4*atomnum); read!(io, gbuf)
+        G = reshape(gbuf, 4, atomnum); Gxyz = Matrix(G[2:4, :])
+        OLP = [Vector{Matrix{Float64}}(undef, FNAN[i]+1) for i in 1:atomnum]
+        for i in 1:atomnum, h in 1:(FNAN[i]+1)
+            B = natn[i][h]
+            OLP[i][h] = _read_block_f64(io, TNO[B], TNO[i])
+        end
+        OLP_r = ntuple(_->([Vector{Matrix{Float64}}(undef, FNAN[i]+1) for i in 1:atomnum]), 3)
+        for α in 1:3, i in 1:atomnum, h in 1:(FNAN[i]+1)
+            B = natn[i][h]
+            OLP_r[α][i][h] = _read_block_f64(io, TNO[B], TNO[i])
+        end
+        FNAN .+= 1  # match legacy convention
+        return (; atomnum, spinP_switch, atv, atv_ijk, TNO, FNAN, natn, ncn, tv, rtv, Gxyz, OLP, OLP_r)
+    end
+end
+
+
+# ===== Tier A: Serialization cache wrapper =====
+
+const _DEEPH_INPUT_FILES = ("lat.dat", "site_positions.dat", "orbital_types.dat",
+                            "hamiltonians_pred.h5", "openmx_olpr.scfout")
+
+function _cache_path(dir::String, sparse::Bool)
+    return joinpath(dir, sparse ? "tm_sparse_cache.jls" : "tm_dense_cache.jls")
+end
+
+function _cache_is_fresh(cache_path::String, dir::String)
+    isfile(cache_path) || return false
+    cmtime = mtime(cache_path)
+    for fname in _DEEPH_INPUT_FILES
+        path = joinpath(dir, fname)
+        isfile(path) || return false
+        mtime(path) > cmtime && return false
+    end
+    return true
+end
+
+"""
+    createmodeldeephopenmx(dir; sparse=false, fast=true, cache=true, force_rebuild=false)
+
+Construct a tight-binding model from a DeepH OpenMX-style directory.
+
+The directory `dir` is expected to contain:
+
+  * `lat.dat` – three lines with lattice vectors in Bohr units.
+  * `orbital_types.dat` – one line per atom listing orbital types.
+  * `site_positions.dat` – three lines giving atomic positions (Bohr).
+  * `hamiltonians_pred.h5` – datasets named `[i, j, k, atom_i, atom_j]`
+    with Hamiltonian blocks.
+  * `openmx_olpr.scfout` – overlap and position matrices as produced by
+    OpenMX's `OLP` output.
+
+All position-operator lengths are converted from Bohr to Å.
+
+# Keyword arguments
+
+- `sparse::Bool=false`  return a `SparseTBModel` if `true`, otherwise a `TBModel`.
+- `fast::Bool=true`     use the COO-triplet builder (Tier B). Falls back to
+                        the legacy element-by-element builder when `fast=false`
+                        or `sparse=false`.
+- `cache::Bool=true`    cache the built model to `<dir>/tm_{sparse,dense}_cache.jls`
+                        and reuse on subsequent calls. The cache is invalidated
+                        whenever any input file's mtime is newer than the cache.
+- `force_rebuild::Bool=false`  ignore the cache and rebuild.
+"""
+function createmodeldeephopenmx(dir::String; sparse::Bool=false,
+                                 fast::Bool=true, cache::Bool=true,
+                                 force_rebuild::Bool=false)
+    cpath = _cache_path(dir, sparse)
+    if cache && !force_rebuild && _cache_is_fresh(cpath, dir)
+        @info "[deeph-loader] loading cached TB model from $cpath"
+        try
+            return Serialization.deserialize(cpath)
+        catch err
+            @warn "[deeph-loader] cache deserialization failed; rebuilding" exception=(err, catch_backtrace())
+        end
+    end
+
+    nm = if sparse && fast
+        _build_deeph_fast(dir; sparse=true)
+    else
+        _build_deeph_legacy(dir; sparse=sparse)
+    end
+
+    if cache
+        @info "[deeph-loader] writing TB model cache to $cpath"
+        try
+            Serialization.serialize(cpath, nm)
+        catch err
+            @warn "[deeph-loader] cache serialization failed" exception=(err, catch_backtrace())
+        end
+    end
     return nm
 end
 
