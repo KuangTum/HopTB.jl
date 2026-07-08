@@ -218,8 +218,8 @@ function _orthonormalize_eigenpairs(H::AbstractMatrix{ComplexF64},
     # a small dense m×m matrix without ever materializing dense H/S.
     # Same parenthesization trick as in getvelocity_formula: `Q' * (M * Q)` runs
     # SparseMatrixCSC * Matrix first (optimized), avoiding the slow dense*sparse path.
-    Ssub = Hermitian(Q' * (S * Q))
-    Hsub = Hermitian(Q' * (H * Q))
+    Ssub = Hermitian(Q' * HopTB._sparse_times_dense(S, Q))
+    Hsub = Hermitian(Q' * HopTB._sparse_times_dense(H, Q))
 
     # Step 3: eigen-decompose Ssub and drop ill-conditioned directions
     evalS, vecS = eigen(Ssub)
@@ -236,7 +236,7 @@ function _orthonormalize_eigenpairs(H::AbstractMatrix{ComplexF64},
     # Step 4: reduced generalized problem
     Qp = Q * V
     Ssub_p = Matrix(Diagonal(real.(Λ)))
-    Hsub_p = Hermitian(Qp' * (H * Qp))
+    Hsub_p = Hermitian(Qp' * HopTB._sparse_times_dense(H, Qp))
     eval_new, Z = eigen(Hsub_p, Hermitian(Ssub_p))
 
     # Step 5: map back
@@ -268,6 +268,7 @@ struct PardisoShiftOp
     matrix
     rhs_buffer::Vector{ComplexF64}
     S::Union{Nothing,AbstractMatrix{ComplexF64}}
+    S_herm::Bool     # S verified Hermitian -> threaded conj-column SpMV is valid
     dummy::Vector{ComplexF64}
     n::Int
 end
@@ -308,6 +309,8 @@ function LinearAlgebra.mul!(y::AbstractVector{ComplexF64}, op::PardisoShiftOp, x
     t0 = time_ns()
     if op.S === nothing
         copyto!(op.rhs_buffer, x)
+    elseif op.S_herm && op.S isa SparseMatrixCSC{ComplexF64,Int64} && Threads.nthreads() > 1
+        HopTB.hermitian_spmv_threaded!(op.rhs_buffer, op.S, x)
     else
         mul!(op.rhs_buffer, op.S, x)
     end
@@ -364,7 +367,8 @@ function _build_pardiso_linear_operator(H::AbstractMatrix{ComplexF64},
     # HOPTB_FORCE_DENSE_S=true restores the old behavior for A/B benchmarks.
     S_store = (S !== nothing && get(ENV, "HOPTB_FORCE_DENSE_S", "") == "true") ?
         Matrix{ComplexF64}(S) : S
-    return PardisoShiftOp(solver, Ap, rhs_buffer, S_store, dummy, n)
+    S_herm = S_store isa SparseMatrixCSC{ComplexF64,Int64} && ishermitian(S_store)
+    return PardisoShiftOp(solver, Ap, rhs_buffer, S_store, S_herm, dummy, n)
 end
 
 function _arpack_eigs_pardiso(H::AbstractMatrix{ComplexF64},
