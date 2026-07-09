@@ -2,6 +2,7 @@ module SparseCalc
 
 using LinearAlgebra
 using SparseArrays
+using Random
 using Arpack
 using HDF5
 
@@ -9,7 +10,7 @@ using ..HopTB
 using ..HopTB: AbstractTBModel
 using ..HopTB.Memoize: @memoize
 
-export PartialHermEig, eigs_near, eigs_window, pardiso_available
+export PartialHermEig, eigs_near, eigs_near_block, eigs_window, pardiso_available
 
 # ----- HDF5 eigenpair cache (full-diag only) -------------------------------
 # Set ENV["HOPTB_EIGCACHE_DIR"] to a directory before the first eigs_near
@@ -477,6 +478,164 @@ end
         compute_res = compute_res[mask]
     end
     return PartialHermEig(energies, vecs, compute_res, ref)
+end
+
+# ---- Block shift-invert Lanczos (Stage 4b) ---------------------------------
+#
+# Rationale (measured, 110k-orbital slab): a Pardiso triangular solve costs
+# 3.17 s for one RHS but 0.074 s/RHS for 128 at once (43x amortization), and
+# ARPACK converged nev=500 with a Krylov space of exactly ncv~2*nev in a
+# single restart. So: build the same-size Krylov basis with the SAME
+# factorization but in block solves, then one Rayleigh-Ritz.
+
+_smul(S::Nothing, X::AbstractMatrix) = copy(X)
+_smul(S::SparseMatrixCSC, X::AbstractMatrix) = HopTB.spmm_threaded(S, X)
+_smul(S::AbstractMatrix, X::AbstractMatrix) = S * X
+
+# Y = A^{-1} B via Pardiso phase 33, chunked so each call has <= chunk RHS.
+function _pardiso_block_solve!(Y::Matrix{ComplexF64}, op::PardisoShiftOp,
+        B::AbstractMatrix{ComplexF64}, chunk::Int)
+    n, m = size(B)
+    for lo in 1:chunk:m
+        hi = min(lo + chunk - 1, m)
+        t0 = time_ns()
+        Pardiso.set_phase!(op.solver, Pardiso.SOLVE_ITERATIVE_REFINE)
+        Pardiso.pardiso(op.solver, view(Y, :, lo:hi), op.matrix, view(B, :, lo:hi))
+        MATVEC_STATS[:n] += hi - lo + 1
+        MATVEC_STATS[:solve] += (time_ns() - t0) / 1e9
+    end
+    return Y
+end
+
+# S-metric whitening of W (returns W, SW with W' S W = I); drops near-null
+# directions. SW must equal S*W on entry and is kept consistent.
+function _s_whiten!(W::Matrix{ComplexF64}, SW::Matrix{ComplexF64}; rank_tol::Float64=1e-10)
+    G = Hermitian(W' * SW)
+    F = eigen(G)
+    keep = F.values .> rank_tol * max(maximum(abs.(F.values)), eps())
+    any(keep) || return W[:, 1:0], SW[:, 1:0]
+    T = F.vectors[:, keep] * Diagonal(1 ./ sqrt.(F.values[keep]))
+    return W * T, SW * T
+end
+
+@doc raw"""
+```julia
+eigs_near_block(tm, k, reference; nstates=500, block=128, basis_mult=2.2,
+    tol=1e-7, max_basis_mult=3.2, window=nothing)::PartialHermEig
+```
+
+Block shift-invert Lanczos for the `nstates` generalized eigenpairs of
+(H(k), S(k)) nearest `reference`. Factorizes H-σS once (σ=`reference`), builds
+an S-orthonormal Krylov basis of ≈`basis_mult*nstates` columns using
+`block`-wide multi-RHS Pardiso solves, then Rayleigh–Ritz. If the wanted
+residuals exceed `tol`, the basis is extended up to `max_basis_mult*nstates`.
+Returns the same `PartialHermEig` as `eigs_near` (residuals always computed).
+"""
+@memoize k function eigs_near_block(tm::AbstractTBModel, k::AbstractVector{<:Real},
+    reference::Real; nstates::Integer=500, block::Integer=128,
+    basis_mult::Real=2.2, tol::Real=1e-7, max_basis_mult::Real=3.2,
+    window::Union{Nothing,Real}=nothing)::PartialHermEig
+    n = tm.norbits
+    ref = Float64(reference)
+    nst = clamp(Int(nstates), 1, n)
+    blk = clamp(Int(block), 1, n)
+    Hmat = HopTB.getdH(tm, (0, 0, 0), k)
+    Smat = tm.isorthogonal ? nothing : HopTB.getdS(tm, (0, 0, 0), k)
+    op = _build_pardiso_linear_operator(Hmat, Smat, ref)
+    try
+        target = clamp(ceil(Int, Float64(basis_mult) * nst), blk, n)
+        maxdim = clamp(ceil(Int, Float64(max_basis_mult) * nst), target, n)
+        rng = MersenneTwister(0x5eed1 + Int(nst) + 7919 * round(Int, 1e6 * sum(abs.(k))))
+
+        V  = Matrix{ComplexF64}(undef, n, 0)   # S-orthonormal basis
+        SV = Matrix{ComplexF64}(undef, n, 0)   # S * V (cached: projections need no SpMM)
+        # Start in the range of the operator: one op application to the random
+        # block suppresses ghost Ritz pairs from raw noise directions.
+        W0 = randn(rng, ComplexF64, n, blk)
+        W  = _pardiso_block_solve!(Matrix{ComplexF64}(undef, n, blk), op, _smul(Smat, W0), blk)
+
+        θ = Float64[]; C = Matrix{ComplexF64}(undef, 0, 0)
+        HV = Matrix{ComplexF64}(undef, n, 0)
+        while true
+            # Pre-projection S-norms: any column whose S-norm collapses during
+            # projection is numerically inside span(V); whitening it back to
+            # unit norm would amplify rounding noise into a fake basis vector
+            # that poisons Rayleigh-Ritz. Deflate such columns instead.
+            SW0 = _smul(Smat, W)
+            pre = sqrt.(abs.(vec(sum(conj.(W) .* SW0; dims=1))))
+            # orthogonalize W against V in the S-metric (CGS x2, cached SV)
+            if size(V, 2) > 0
+                for _ in 1:2
+                    W .-= V * (SV' * W)
+                end
+            end
+            SW = _smul(Smat, W)
+            post = sqrt.(abs.(vec(sum(conj.(W) .* SW; dims=1))))
+            keep = post .> 1e-8 .* max.(pre, eps())
+            if !all(keep)
+                W = W[:, keep]; SW = SW[:, keep]
+            end
+            if size(W, 2) > 0
+                W, SW = _s_whiten!(W, SW; rank_tol=1e-8)
+            end
+            exhausted = size(W, 2) == 0
+            if exhausted && size(V, 2) == 0
+                @warn "eigs_near_block: start block deflated to nothing."
+                break
+            end
+            V  = hcat(V, W)
+            SV = hcat(SV, SW)
+            basis_done = exhausted || size(V, 2) >= target
+            # next Lanczos block: W <- A^{-1} (S * last block)
+            if !basis_done
+                W = _pardiso_block_solve!(Matrix{ComplexF64}(undef, n, size(SW, 2)), op, SW, blk)
+                continue
+            end
+            # Rayleigh-Ritz on span(V): Ssub = I by construction.
+            # Selection must be residual-aware: an unconverged Krylov direction
+            # can place a ghost Ritz value arbitrarily close to ref. Accept the
+            # nstates nearest-ref pairs only when every one of them is converged;
+            # otherwise grow the basis (ghosts either converge or drift away).
+            HV = _smul(Hmat, V)
+            F = eigen(Hermitian(V' * HV))
+            order = sortperm(abs.(F.values .- ref))
+            ncand = min(length(order), nst)
+            sel = order[1:ncand]
+            θ = F.values[sel]
+            C = F.vectors[:, sel]
+            Rmat = HV * C - (SV * C) * Diagonal(θ)
+            res = vec(sqrt.(sum(abs2, Rmat; dims=1)))
+            if maximum(res) <= Float64(tol) || size(V, 2) >= maxdim || exhausted
+                maximum(res) > Float64(tol) &&
+                    @warn "eigs_near_block: max wanted residual $(maximum(res)) > tol at basis $(size(V,2))/$maxdim (exhausted=$exhausted)."
+                break
+            end
+            # extend basis and retry
+            target = min(maxdim, max(target + 2 * blk, ceil(Int, 1.25 * target)))
+            W = _pardiso_block_solve!(Matrix{ComplexF64}(undef, n, size(SW, 2)), op, SW, blk)
+        end
+        if isempty(θ) && size(V, 2) > 0
+            HV = _smul(Hmat, V)
+            F = eigen(Hermitian(V' * HV))
+            order = sortperm(abs.(F.values .- ref))
+            sel = order[1:min(nst, length(order))]
+            θ = F.values[sel]
+            C = F.vectors[:, sel]
+        end
+        isempty(θ) && error("eigs_near_block: no Ritz pairs obtained.")
+        X = V * C
+        Rmat = HV * C - (SV * C) * Diagonal(θ)
+        res = vec(sqrt.(sum(abs2, Rmat; dims=1)))
+        energies = Float64.(θ)
+        if window !== nothing
+            win = Float64(window)
+            mask = abs.(energies .- ref) .<= win
+            energies = energies[mask]; X = X[:, mask]; res = res[mask]
+        end
+        return PartialHermEig(energies, X, res, ref)
+    finally
+        _pardiso_cleanup!(op)
+    end
 end
 
 function eigs_window(tm::AbstractTBModel, k::AbstractVector{<:Real}, reference::Real,

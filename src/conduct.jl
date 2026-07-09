@@ -3,7 +3,7 @@ module Conduct
 using LinearAlgebra, Distributed
 import Spglib
 using ..HopTB
-using ..HopTB.SparseCalc: PartialHermEig, eigs_near, eigs_window
+using ..HopTB.SparseCalc: PartialHermEig, eigs_near, eigs_near_block, eigs_window
 using ..HopTB.Utilities:
     fermidirac,
     dfermi_dE,
@@ -246,6 +246,8 @@ const VELOCITY_DEGENERACY_EPS = 1e-7
 
 const DEFAULT_SPARSE_OPTS = (
     use_sparse = false,
+    eigensolver = :arpack,
+    block = 128,
     window = nothing,
     nev = 16,
     min_states = 6,
@@ -265,6 +267,8 @@ function _normalize_sparse_opts(opts)
     end
     return (
         use_sparse = opts.use_sparse,
+        eigensolver = Symbol(opts.eigensolver),
+        block = max(1, Int(opts.block)),
         window = window,
         nev = max(1, Int(opts.nev)),
         min_states = max(0, Int(opts.min_states)),
@@ -285,6 +289,17 @@ function _ac_get_sparse_spec(
 )
     opts.use_sparse || return nothing
     μval = Float64(μ)
+    if opts.eigensolver === :block
+        return eigs_near_block(
+            tm,
+            k,
+            μval;
+            nstates = opts.nev,
+            block = opts.block,
+            tol = max(opts.tol, 1e-9),
+            window = opts.window,
+        )
+    end
     if opts.window !== nothing && opts.min_states > 0
         return eigs_window(
             tm,
@@ -766,6 +781,8 @@ function getAC(
     symmetrize::Bool=use_symmetry,
     symmetrize_match_ibz::Bool=true,
     use_sparse::Bool=false,
+    sparse_eigensolver::Symbol=DEFAULT_SPARSE_OPTS.eigensolver,
+    sparse_block::Int=DEFAULT_SPARSE_OPTS.block,
     transition_delta_window::Union{Nothing,Float64}=nothing,
     sparse_window::Union{Nothing,Float64}=nothing,
     sparse_nev::Int=DEFAULT_SPARSE_OPTS.nev,
@@ -812,6 +829,8 @@ function getAC(
         DEFAULT_SPARSE_OPTS,
         (
             use_sparse = use_sparse,
+            eigensolver = sparse_eigensolver,
+            block = sparse_block,
             window = sparse_window,
             nev = sparse_nev,
             min_states = sparse_min_states,
