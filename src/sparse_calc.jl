@@ -530,6 +530,14 @@ an S-orthonormal Krylov basis of ≈`basis_mult*nstates` columns using
 `block`-wide multi-RHS Pardiso solves, then Rayleigh–Ritz. If the wanted
 residuals exceed `tol`, the basis is extended up to `max_basis_mult*nstates`.
 Returns the same `PartialHermEig` as `eigs_near` (residuals always computed).
+
+!!! warning "Measured no-go for clustered shift-invert spectra (July 2026)"
+    At 110k orbitals / nev=500 this runs 5-10x faster than ARPACK but leaves
+    10-30% of wanted states unconverged even at 4.2x basis: block width does
+    not substitute for Krylov depth in a clustered transformed spectrum, and
+    ARPACK (2 solves/state, one restart) is depth-optimal there. Kept for
+    experimentation; production uses `:arpack`. Evidence: jobs 15050414,
+    15056526; notesforcode PDF section 9.5.
 """
 @memoize k function eigs_near_block(tm::AbstractTBModel, k::AbstractVector{<:Real},
     reference::Real; nstates::Integer=500, block::Integer=128,
@@ -572,6 +580,10 @@ Returns the same `PartialHermEig` as `eigs_near` (residuals always computed).
             SW = _smul(Smat, W)
             post = sqrt.(abs.(vec(sum(conj.(W) .* SW; dims=1))))
             keep = post .> 1e-8 .* max.(pre, eps())
+            if get(ENV, "HOPTB_BLOCK_DEBUG", "") == "true"
+                shr = post ./ max.(pre, eps())
+                @info "block-append" basis=size(V, 2) newcols=size(W, 2) min_shrink=minimum(shr) max_shrink=maximum(shr) ndrop=count(!, keep)
+            end
             if !all(keep)
                 W = W[:, keep]; SW = SW[:, keep]
             end
@@ -610,9 +622,16 @@ Returns the same `PartialHermEig` as `eigs_near` (residuals always computed).
                     @warn "eigs_near_block: max wanted residual $(maximum(res)) > tol at basis $(size(V,2))/$maxdim (exhausted=$exhausted)."
                 break
             end
-            # extend basis and retry
-            target = min(maxdim, max(target + 2 * blk, ceil(Int, 1.25 * target)))
-            W = _pardiso_block_solve!(Matrix{ComplexF64}(undef, n, size(SW, 2)), op, SW, blk)
+            # Extend the basis with inverse-iteration images of the WORST
+            # Ritz vectors (Davidson-style targeted expansion) instead of
+            # blindly continuing the Krylov chain: S*X_sel = SV*C is a GEMM on
+            # the cached SV, and each A^{-1} application contracts precisely
+            # the states that failed the residual test (window-edge states).
+            worst = sortperm(res; rev=true)
+            nexp = min(length(worst), 2 * blk)
+            Wrhs = SV * C[:, worst[1:nexp]]
+            target = min(maxdim, max(target + nexp, ceil(Int, 1.15 * target)))
+            W = _pardiso_block_solve!(Matrix{ComplexF64}(undef, n, nexp), op, Wrhs, blk)
         end
         if isempty(θ) && size(V, 2) > 0
             HV = _smul(Hmat, V)
